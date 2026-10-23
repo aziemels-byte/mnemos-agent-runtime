@@ -1,0 +1,16 @@
+{
+  "name": "mnemos-agent-runtime",
+  "version": "0.1.0",
+  "description": "Selected MNEMOS runtime components: candidate verification, phase-aware cancellation, failure classification and checkpoint recovery.",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "Andris Ziemelis",
+  "engines": { "node": ">=24" },
+  "exports": "./src/index.mjs",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "demo": "node examples/run.mjs",
+    "check:publication": "node scripts/check-publication.mjs"
+  }
+}

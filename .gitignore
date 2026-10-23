@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+*.local.json
+*.log
+*.tmp
+*.pem
+*.key
+coverage/
+runtime/
+state/
+reports/
+.DS_Store
+Thumbs.db
