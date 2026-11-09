@@ -13,6 +13,7 @@ npm test
 npm run demo
 npm run check:publication
 node examples/lease-and-idempotency.mjs
+node examples/quality-gate.mjs
 ```
 
 The demo creates a temporary workspace, rejects an empty candidate without starting regression, validates an actual code change in a child Node.js process, starts and cancels an owned child process, saves a checkpoint, and launches a **fresh Node.js process** to reconcile the cancelled attempt and explicitly complete a report. It cleans up its temporary files.
@@ -28,6 +29,8 @@ The demo creates a temporary workspace, rejects an empty candidate without start
 | `FileCheckpointStore` | Bound JSON size and atomically replace a checkpoint file | Writes are serialized within one store instance; multi-process locking is out of scope |
 | `IdempotencyRegistry` | Journal effect intent and prevent ambiguous retries | Durable safety requires a caller-provided persistent journal; external reconciliation is required for UNKNOWN |
 | `ResourceLeaseManager` | Reserve named resources exclusively with expiring leases | Single-process registry; not a distributed lock or permission to execute compute |
+| `QualityGate` | Fail-closed evaluation of candidate test receipts and regression metrics | Read-only decision; human review is mandatory and supplied evidence is not authenticated |
+| `QualityFloorPolicy` | Propose routes meeting a minimum expected quality threshold | Does not execute providers or validate forecast calibration |
 
 ```mermaid
 flowchart LR
@@ -64,6 +67,31 @@ The snippet shows the interface. The [runnable example](examples/verify-candidat
 Run `node examples/lease-and-idempotency.mjs` for a synthetic resource lease and a deduplicated operation. The idempotency adapter accepts `appendEvent(type, key, { record })` and `listEvents({ typePrefix })`; records may include results and must be kept in private storage. No store means process-local deduplication only. Request fingerprints are based on JSON serialization, so callers must use stable request shapes.
 
 The lease manager requires a `nodeRegistry.require(nodeId)` adapter whose nodes declare VERIFIED trust and AVAILABLE status. Leases are in-memory, exclusive per node and resource, and require explicit caller authorization. This is not a cross-process lock, remote permission grant, or GPU scheduler.
+
+
+## Quality Gate
+
+MNEMOS includes a standalone, **read-only** quality gate for agent-generated change candidates. The public extraction combines concepts from five private modules; it does not expose the production orchestration code.
+
+```js
+import { QualityGate } from './src/index.mjs';
+
+const decision = new QualityGate().review({
+  definition: {
+    executionPolicy: { requiresIsolatedWorktree: true },
+    approvalPolicy: { autoMerge: false }
+  },
+  checks: { unit: unitReceipt, integration: integrationReceipt,
+    regression: regressionReceipt, benchmark: benchmarkReceipt,
+    security: securityReceipt, recovery: recoveryReceipt },
+  baseline: baselineMetrics,
+  candidate: candidateMetrics
+});
+```
+
+Each required receipt must contain `passed: true`, `completed: true`, `exitCode: 0` and a non-empty `evidenceId`. Metrics require equal positive sample counts, finite success rate, quality, cost and latency, and nonnegative regression counts. Only non-regressing candidates with all required receipts return `READY_FOR_HUMAN_REVIEW`. The optional release qualification checks eight additional categories with traceable evidence. `QualityFloorPolicy` proposes candidate routes above a configured quality threshold without executing any provider.
+
+Run the synthetic example with `node examples/quality-gate.mjs`. The package does **not** run tests, authenticate external receipts, attest that a real worktree was isolated, establish benchmark equivalence, merge code or deploy changes. A trusted caller must supply real results and independently enforce policy; passing this gate is not a production safety certification.
 
 ## Design decisions and limits
 

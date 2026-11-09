@@ -26,4 +26,5 @@ jobs:
           package-manager-cache: false
       - run: npm test
       - run: npm run demo
+      - run: node examples/quality-gate.mjs
       - run: npm run check:publication
