@@ -12,6 +12,7 @@ Requires Node.js 24 or later. There are **no external runtime or development dep
 npm test
 npm run demo
 npm run check:publication
+node examples/lease-and-idempotency.mjs
 ```
 
 The demo creates a temporary workspace, rejects an empty candidate without starting regression, validates an actual code change in a child Node.js process, starts and cancels an owned child process, saves a checkpoint, and launches a **fresh Node.js process** to reconcile the cancelled attempt and explicitly complete a report. It cleans up its temporary files.
@@ -25,6 +26,8 @@ The demo creates a temporary workspace, rejects an empty candidate without start
 | `classifyProviderFailure` | Separate authentication, quota, model, timeout and transport failures; redact known credential patterns | It never retries, changes accounts or silently selects another model |
 | `GoalRecoveryCoordinator` | Restore a checkpoint and reconcile each recorded job | Restoring state never automatically replays a task |
 | `FileCheckpointStore` | Bound JSON size and atomically replace a checkpoint file | Writes are serialized within one store instance; multi-process locking is out of scope |
+| `IdempotencyRegistry` | Journal effect intent and prevent ambiguous retries | Durable safety requires a caller-provided persistent journal; external reconciliation is required for UNKNOWN |
+| `ResourceLeaseManager` | Reserve named resources exclusively with expiring leases | Single-process registry; not a distributed lock or permission to execute compute |
 
 ```mermaid
 flowchart LR
@@ -56,6 +59,12 @@ const result = await verify({
 
 The snippet shows the interface. The [runnable example](examples/verify-candidate.mjs) supplies a real file adapter and executes a real regression check. A production adapter must include tracked changes, deletions, renames and untracked files in its inventory, using repository-relative forward-slash paths. A `passed` flag without a zero exit code does not verify a candidate.
 
+## Additional safety examples
+
+Run `node examples/lease-and-idempotency.mjs` for a synthetic resource lease and a deduplicated operation. The idempotency adapter accepts `appendEvent(type, key, { record })` and `listEvents({ typePrefix })`; records may include results and must be kept in private storage. No store means process-local deduplication only. Request fingerprints are based on JSON serialization, so callers must use stable request shapes.
+
+The lease manager requires a `nodeRegistry.require(nodeId)` adapter whose nodes declare VERIFIED trust and AVAILABLE status. Leases are in-memory, exclusive per node and resource, and require explicit caller authorization. This is not a cross-process lock, remote permission grant, or GPU scheduler.
+
 ## Design decisions and limits
 
 - Cheap structural checks run before expensive tests. Malformed paths fail instead of disappearing from the allowed-scope check.
@@ -64,6 +73,7 @@ The snippet shows the interface. The [runnable example](examples/verify-candidat
 - Checkpoints are versioned and bounded to 1 MiB. Malformed state and failed job inspection require reconciliation. Stored state is not an instruction to execute work.
 - Checkpoint files use same-directory replacement and a flushed temporary file. This is not a claim of multi-host durability, directory-fsync guarantees or protection against an attacker controlling the state directory. Use an owner-controlled directory. Unix permission bits do not replace Windows ACLs.
 - Diagnostic redaction recognizes selected credential patterns. It is best-effort and does not make arbitrary logs or personal data safe to publish.
+- Idempotency and leases do not supply exactly-once execution across arbitrary processes. A failed or lost effect receipt is UNKNOWN until authoritative reconciliation. A successful remote resource lease does not permit remote execution by itself.
 - No model quality, token savings, benchmark score or commercial production scale is claimed by this sample.
 
 ## Provenance
