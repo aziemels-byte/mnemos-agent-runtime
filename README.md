@@ -73,7 +73,7 @@ The lease manager requires a `nodeRegistry.require(nodeId)` adapter whose nodes 
 
 MNEMOS includes a standalone, **read-only** quality gate for agent-generated change candidates. The public extraction combines concepts from five private modules; it does not expose the production orchestration code.
 
-\`\`\`js
+```js
 import { QualityGate } from './src/index.mjs';
 
 const decision = new QualityGate().review({
@@ -87,12 +87,11 @@ const decision = new QualityGate().review({
   baseline: baselineMetrics,
   candidate: candidateMetrics
 });
-\`\`\`
+```
 
-Each required receipt must contain \`passed: true\`, \`completed: true\`, \`exitCode: 0\` and a non-empty \`evidenceId\`. Metrics require equal positive sample counts, finite success rate, quality, cost and latency, and nonnegative regression counts. Only non-regressing candidates with all required receipts return \`READY_FOR_HUMAN_REVIEW\`. The optional release qualification checks eight additional categories with traceable evidence. \`QualityFloorPolicy\` proposes candidate routes above a configured quality threshold without executing any provider.
+Each required receipt must contain `passed: true`, `completed: true`, `exitCode: 0` and a non-empty `evidenceId`. Metrics require equal positive sample counts, finite success rate, quality, cost and latency, and nonnegative regression counts. Only non-regressing candidates with all required receipts return `READY_FOR_HUMAN_REVIEW`. The optional release qualification checks eight additional categories with traceable evidence. `QualityFloorPolicy` proposes candidate routes above a configured quality threshold without executing any provider.
 
-Run the synthetic example with \`node examples/quality-gate.mjs\`. The package does **not** run tests, authenticate external receipts, attest that a real worktree was isolated, establish benchmark equivalence, merge code or deploy changes. A trusted caller must supply real results and independently enforce policy; passing this gate is not a production safety certification.
-
+Run the synthetic example with `node examples/quality-gate.mjs`. The package does **not** run tests, authenticate external receipts, attest that a real worktree was isolated, establish benchmark equivalence, merge code or deploy changes. A trusted caller must supply real results and independently enforce policy; passing this gate is not a production safety certification.
 
 ## Design decisions and limits
 
