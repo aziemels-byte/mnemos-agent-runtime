@@ -28,6 +28,8 @@ export class IdempotencyRegistry {
     this.clock = clock;
     this.records = new Map();
     this.inflight = new Map();
+    this.reconciling = new Set();
+    this.restoring = false;
   }
 
   async persist(type, record) {
@@ -37,28 +39,38 @@ export class IdempotencyRegistry {
   }
 
   async restore() {
+    if (this.restoring) throw new Error('Restoration is already in progress');
     if (this.inflight.size) throw new Error('Cannot restore while operations are running');
+    if (this.reconciling.size) throw new Error('Cannot restore while reconciliation is running');
     if (!this.store) return this.snapshot();
-    const events = await this.store.listEvents({ typePrefix: 'idempotency.' });
-    this.records.clear();
-    for (const event of events) {
-      const record = event?.data?.record;
-      if (typeof record?.key === 'string' && typeof record.fingerprint === 'string') {
-        this.records.set(record.key, copy(record));
+    // Reserve the registry before calling the asynchronous journal adapter.
+    this.restoring = true;
+    try {
+      const events = await this.store.listEvents({ typePrefix: 'idempotency.' });
+      this.records.clear();
+      for (const event of events) {
+        const record = event?.data?.record;
+        if (typeof record?.key === 'string' && typeof record.fingerprint === 'string') {
+          this.records.set(record.key, copy(record));
+        }
       }
+      for (const record of [...this.records.values()]) {
+        if (record.state !== 'STARTED') continue;
+        const unknown = { ...record, state: 'UNKNOWN', unknownAt: this.clock().toISOString(),
+          reconciliationRequired: true, reason: 'INTERRUPTED_AFTER_EFFECT_START' };
+        this.records.set(record.key, unknown); // fail closed even if the journal write fails
+        await this.persist('idempotency.unknown', unknown);
+      }
+      return this.snapshot();
+    } finally {
+      this.restoring = false;
     }
-    for (const record of [...this.records.values()]) {
-      if (record.state !== 'STARTED') continue;
-      const unknown = { ...record, state: 'UNKNOWN', unknownAt: this.clock().toISOString(),
-        reconciliationRequired: true, reason: 'INTERRUPTED_AFTER_EFFECT_START' };
-      this.records.set(record.key, unknown); // fail closed even if the journal write fails
-      await this.persist('idempotency.unknown', unknown);
-    }
-    return this.snapshot();
   }
 
   async execute({ key, request = {}, operation, retryFailed = false, failureProvesNoEffect = false } = {}) {
     key = requiredString(key, 'key');
+    if (this.restoring) throw new Error('Restoration is in progress');
+    if (this.reconciling.has(key)) throw new Error('Reconciliation is running for this key');
     if (typeof operation !== 'function') throw new TypeError('operation must be a function');
     const fingerprint = requestFingerprint(request);
     const active = this.inflight.get(key);
@@ -79,7 +91,8 @@ export class IdempotencyRegistry {
     }
     const started = { key, fingerprint, state: 'STARTED', startedAt: this.clock().toISOString(),
       attempt: (previous?.attempt ?? 0) + 1 };
-    const promise = this.runEffect(started, operation, failureProvesNoEffect);
+    // Install the reservation before a journal adapter can call back into us.
+    const promise = Promise.resolve().then(() => this.runEffect(started, operation, failureProvesNoEffect));
     this.inflight.set(key, { fingerprint, promise });
     try { return await promise; }
     finally { if (this.inflight.get(key)?.promise === promise) this.inflight.delete(key); }
@@ -114,24 +127,34 @@ export class IdempotencyRegistry {
 
   async reconcile({ key, request = {}, disposition, result = null, evidence } = {}) {
     key = requiredString(key, 'key');
+    if (this.restoring) throw new Error('Restoration is in progress');
+    if (this.inflight.has(key)) throw new Error('Cannot reconcile while the operation is running');
+    if (this.reconciling.has(key)) throw new Error('Reconciliation is already running for this key');
     const record = this.records.get(key);
     if (!record) return { status: 'IDEMPOTENCY_NOT_FOUND', key, reconciled: false };
     if (record.fingerprint !== requestFingerprint(request)) return { status: 'IDEMPOTENCY_CONFLICT', key, reconciled: false };
     if (!['UNKNOWN', 'STARTED'].includes(record.state)) return { status: 'IDEMPOTENCY_RECONCILIATION_NOT_REQUIRED', key, reconciled: false };
     if (evidence?.authoritative !== true) return { status: 'IDEMPOTENCY_EVIDENCE_REQUIRED', key, reconciled: false };
-    if (disposition === 'COMPLETED') {
-      const completed = { ...record, state: 'COMPLETED', result: copy(result), completedAt: this.clock().toISOString(),
-        reconciliationRequired: false, evidence: copy(evidence) };
-      await this.persist('idempotency.reconciled_completed', completed);
-      return { status: 'IDEMPOTENCY_RECONCILED_COMPLETED', key, reconciled: true, result: copy(result) };
+    // Hold the key through journal persistence, including failures. Other keys
+    // can continue executing; no stale reconciliation may replace a receipt.
+    this.reconciling.add(key);
+    try {
+      if (disposition === 'COMPLETED') {
+        const completed = { ...record, state: 'COMPLETED', result: copy(result), completedAt: this.clock().toISOString(),
+          reconciliationRequired: false, evidence: copy(evidence) };
+        await this.persist('idempotency.reconciled_completed', completed);
+        return { status: 'IDEMPOTENCY_RECONCILED_COMPLETED', key, reconciled: true, result: copy(result) };
+      }
+      if (disposition === 'FAILED_NO_EFFECT' && evidence.effectAbsent === true) {
+        const failed = { ...record, state: 'FAILED', effectAbsent: true, reconciliationRequired: false,
+          evidence: copy(evidence) };
+        await this.persist('idempotency.reconciled_failed', failed);
+        return { status: 'IDEMPOTENCY_RECONCILED_FAILED', key, reconciled: true, retryAllowed: true };
+      }
+      return { status: 'IDEMPOTENCY_INVALID_RECONCILIATION', key, reconciled: false };
+    } finally {
+      this.reconciling.delete(key);
     }
-    if (disposition === 'FAILED_NO_EFFECT' && evidence.effectAbsent === true) {
-      const failed = { ...record, state: 'FAILED', effectAbsent: true, reconciliationRequired: false,
-        evidence: copy(evidence) };
-      await this.persist('idempotency.reconciled_failed', failed);
-      return { status: 'IDEMPOTENCY_RECONCILED_FAILED', key, reconciled: true, retryAllowed: true };
-    }
-    return { status: 'IDEMPOTENCY_INVALID_RECONCILIATION', key, reconciled: false };
   }
 
   snapshot() {
