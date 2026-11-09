@@ -71,7 +71,7 @@ export class ResourceLeaseManager {
     this.reclaimExpired();
     const lease = this.leases.get(leaseId);
     if (!lease) throw new Error('Unknown or expired lease');
-    return lease;
+    return copy(lease);
   }
 
   renew({ leaseId, ownerId, ttlMs = 300_000, explicitAuthorization = false, computeAuthorized = false } = {}) {

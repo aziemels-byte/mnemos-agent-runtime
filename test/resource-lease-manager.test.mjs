@@ -57,3 +57,25 @@ test('leases expire, renew and return defensive copies', () => {
   assert.equal(manager.list().length, 0);
   assert.throws(() => manager.validateExecutionLease({ leaseId: acquired.lease.leaseId }), /expired/);
 });
+
+test('require returns a detached lease that cannot change conflicts, authorization or expiry', () => {
+  let now = new Date('2026-01-01T00:00:00.000Z');
+  const manager = new ResourceLeaseManager({ nodeRegistry: nodeRegistry(), clock: () => now });
+  const request = { ownerId: 'task:owner', nodeId: 'local', resources: ['gpu:0'],
+    ttlMs: 1000, explicitAuthorization: true };
+  const { lease } = manager.acquire(request);
+  const exposed = manager.require(lease.leaseId);
+  exposed.resources.length = 0;
+  exposed.ownerId = 'task:intruder';
+  exposed.nodeId = 'other';
+  exposed.expiresAt = '2027-01-01T00:00:00.000Z';
+  assert.deepEqual(manager.require(lease.leaseId), lease);
+  assert.equal(manager.acquire({ ...request, ownerId: 'task:intruder' }).status, 'LEASE_UNAVAILABLE');
+  assert.throws(() => manager.renew({ leaseId: lease.leaseId, ownerId: 'task:intruder', explicitAuthorization: true }), /owner mismatch/);
+  assert.throws(() => manager.release({ leaseId: lease.leaseId, ownerId: 'task:intruder', explicitAuthorization: true }), /owner mismatch/);
+  assert.deepEqual(manager.validateExecutionLease({ leaseId: lease.leaseId,
+    ownerId: request.ownerId, nodeId: request.nodeId, resource: 'gpu:0' }), lease);
+  now = new Date('2026-01-01T00:00:01.000Z');
+  assert.throws(() => manager.require(lease.leaseId), /expired/);
+  assert.equal(manager.acquire({ ...request, ownerId: 'task:intruder' }).status, 'LEASE_ACQUIRED');
+});
