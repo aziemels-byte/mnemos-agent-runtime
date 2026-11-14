@@ -10,6 +10,7 @@ const allowed = new Set([
   'src/index.mjs', 'src/candidate-verifier.mjs', 'src/phase-job-registry.mjs',
   'src/provider-failure.mjs', 'src/secret-filter.mjs', 'src/checkpoint-recovery.mjs',
   'src/idempotency-registry.mjs', 'src/resource-lease-manager.mjs', 'src/quality-gate.mjs',
+  'src/durable-job-runner.mjs',
   'test/helpers.mjs', 'test/candidate-verifier.test.mjs', 'test/phase-job-registry.test.mjs',
   'test/provider-failure.test.mjs', 'test/checkpoint-recovery.test.mjs', 'test/examples.test.mjs',
   'test/idempotency-registry.test.mjs', 'test/resource-lease-manager.test.mjs', 'test/quality-gate.test.mjs',
