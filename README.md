@@ -114,6 +114,6 @@ These modules were selected from MNEMOS execution, orchestration, recovery and d
 
 The project was developed with AI-assisted tooling. This sample is presented with runnable checks and explicit limitations; generated code alone is not validation.
 
-## Rights
+## License
 
-Copyright 2026 Andris Ziemelis. This is a public portfolio sample with **all rights reserved**, not a permissively licensed open-source release. See [LICENSE](LICENSE). No package is published to npm.
+Copyright (c) 2026 Andris Ziemelis. The code and documentation published **in this repository** are licensed under the [MIT License](LICENSE). This license does not cover unpublished MNEMOS modules, private runtime data or the full MNEMOS application. The sample is not published to npm.

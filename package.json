@@ -4,9 +4,11 @@
   "description": "Selected MNEMOS runtime components: candidate verification, phase-aware cancellation, failure classification and checkpoint recovery.",
   "type": "module",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "author": "Andris Ziemelis",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "exports": "./src/index.mjs",
   "scripts": {
     "test": "node --test test/*.test.mjs",
