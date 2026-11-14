@@ -24,6 +24,7 @@ The demo creates a temporary workspace, rejects an empty candidate without start
 | --- | --- | --- |
 | `createCandidateVerifier` | Validate allowed paths and a non-empty candidate before regression | The workspace adapter must report every changed path; the verifier is not a filesystem sandbox |
 | `PhaseJobRegistry` | Track job identity and execution phase; propagate abort; wait for an owned settlement | A cancellation request or timeout alone is not confirmed termination |
+| `DurableJobRunner` | Checkpoint a job before dispatch, refuse to start a checkpointed job ID again, and durably record its terminal status | One runner instance per checkpoint; no cross-process lock; no reconciliation API |
 | `classifyProviderFailure` | Separate authentication, quota, model, timeout and transport failures; redact known credential patterns | It never retries, changes accounts or silently selects another model |
 | `GoalRecoveryCoordinator` | Restore a checkpoint and reconcile each recorded job | Restoring state never automatically replays a task |
 | `FileCheckpointStore` | Bound JSON size and atomically replace a checkpoint file | Writes are serialized within one store instance; multi-process locking is out of scope |
@@ -97,11 +98,31 @@ Each required receipt must contain `passed: true`, `completed: true`, `exitCode:
 
 Run the synthetic example with `node examples/quality-gate.mjs`. The package does **not** run tests, authenticate external receipts, attest that a real worktree was isolated, establish benchmark equivalence, merge code or deploy changes. A trusted caller must supply real results and independently enforce policy; passing this gate is not a production safety certification.
 
+## Durable job runner
+
+`DurableJobRunner` wraps a `PhaseJobRegistry` and a `GoalRecoveryCoordinator`:
+
+```js
+const runner = new DurableJobRunner({ registry, coordinator, goal: { goalId: 'my_goal' } });
+await runner.start({ jobId: 'job_1', objective: 'Write the report' }); // checkpointed before dispatch
+const snapshot = await runner.wait('job_1');                          // resolves after the terminal status is saved
+```
+
+- `start()` reads the current checkpoint, adds the job to `activeJobs` and saves it before calling `registry.start()`. If the save fails, the job is not started. An unreadable or invalid checkpoint, or one for another goal, is rejected and left untouched.
+- A job ID that is already in the checkpoint is rejected with `code: 'JOB_RECONCILIATION_REQUIRED'` and `reconciliationRequired: true`, whatever its recorded status. This also applies after a restart, so a recorded status (including `FAILED` or `CANCELLED`) never permits automatic replay.
+- `wait()` saves the terminal status in the job's entry: `COMPLETED`, `FAILED`, `CANCELLED` (only with confirmed termination) or `UNKNOWN`. Only the status is saved, never results or executor errors. If the save fails, `wait()` rejects with `reconciliationRequired: true` and the original error as `cause`, and no terminal status is claimed. It returns `null` for a job the registry does not know.
+- Checkpoint updates from `start()` and `wait()` are serialized within one runner instance; executors still run concurrently.
+- **Single writer required:** use exactly one `DurableJobRunner`, in one process, per checkpoint directory, and do not write that checkpoint any other way (for example `coordinator.checkpoint()` or `store.save()`) while it is in use. There is no cross-process lock. Two runners or processes sharing a directory can both start the same job, and their updates can overwrite each other.
+- The job is checkpointed before `registry.start()` validates it. If the registry then rejects it (invalid ID or objective, or registry capacity exhausted), `start()` rejects and the executor never runs, but the ID stays in the checkpoint and is blocked like any other. Use a new job ID.
+- A checkpoint holds at most 1000 jobs and entries are never removed, so a runner refuses new jobs once 1000 are recorded.
+- A job whose entry has no status (for example after a crash) has an unknown outcome. There is no reconciliation API yet: clearing an entry requires an authoritative external check and a deliberate checkpoint change.
+
 ## Design decisions and limits
 
 - Cheap structural checks run before expensive tests. Malformed paths fail instead of disappearing from the allowed-scope check.
 - Cooperative cancellation is distinct from killing an operating-system process. The registry trusts a caller-owned execution adapter's termination evidence. The demo proves termination of one owned child, not arbitrary descendant trees or remote jobs.
 - Registry idempotency lasts only while an entry remains in that in-memory registry. Cross-process exactly-once execution is not claimed.
+- `DurableJobRunner` prevents replay only when the earlier start has already been saved to the checkpoint. Checkpoint updates are serialized within one runner instance only; two runners or processes sharing a checkpoint directory can both start the same job or overwrite each other's entries. Terminal statuses are saved only when `wait()` is called. Entries are never removed, so a checkpoint is limited to 1000 jobs.
 - Checkpoints are versioned and bounded to 1 MiB. Malformed state and failed job inspection require reconciliation. Stored state is not an instruction to execute work.
 - Checkpoint files use same-directory replacement and a flushed temporary file. This is not a claim of multi-host durability, directory-fsync guarantees or protection against an attacker controlling the state directory. Use an owner-controlled directory. Unix permission bits do not replace Windows ACLs.
 - Diagnostic redaction recognizes selected credential patterns. It is best-effort and does not make arbitrary logs or personal data safe to publish.

@@ -18,6 +18,8 @@ This repository has an independent Git history. The original application history
 | Quality floor | `packages/core/src/routing/quality-floor-policy.mjs` | Standalone selection of quality-qualified routes without accounts, calibrated scoring or execution |
 | Atomic checkpoint storage | `packages/core/src/runtime/store.mjs` | Only the atomic-file pattern; no conversations, event journals, task definitions or private storage layout |
 
+`DurableJobRunner` (`src/durable-job-runner.mjs`) was written for this public sample on top of the extracted registry and recovery components; it is not extracted from a private MNEMOS module.
+
 Formatting, interfaces, validation and tests were adapted for this standalone sample. It is not an unmodified mirror of the private runtime. Source hashes and extraction evidence are retained locally by the author.
 
 Examples and test fixtures in this repository were created for this sample. They contain no production conversations, account profiles or execution logs.
