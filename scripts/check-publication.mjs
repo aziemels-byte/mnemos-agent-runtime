@@ -9,12 +9,14 @@ const allowed = new Set([
   'LICENSE', 'README.md', 'PROVENANCE.md', 'SECURITY.md', 'package.json', 'package-lock.json',
   'src/index.mjs', 'src/candidate-verifier.mjs', 'src/phase-job-registry.mjs',
   'src/provider-failure.mjs', 'src/secret-filter.mjs', 'src/checkpoint-recovery.mjs',
-  'src/idempotency-registry.mjs', 'src/resource-lease-manager.mjs', 'src/quality-gate.mjs',
+  'src/idempotency-registry.mjs', 'src/resource-lease-manager.mjs', 'src/directory-lock.mjs', 'src/quality-gate.mjs',
   'test/helpers.mjs', 'test/candidate-verifier.test.mjs', 'test/phase-job-registry.test.mjs',
   'test/provider-failure.test.mjs', 'test/checkpoint-recovery.test.mjs', 'test/examples.test.mjs',
-  'test/idempotency-registry.test.mjs', 'test/resource-lease-manager.test.mjs', 'test/quality-gate.test.mjs',
+  'test/idempotency-registry.test.mjs', 'test/resource-lease-manager.test.mjs',
+  'test/resource-lease-cross-process.test.mjs', 'test/checkpoint-cross-process.test.mjs',
+  'test/idempotency-cross-process.test.mjs', 'test/quality-gate.test.mjs',
   'examples/run.mjs', 'examples/verify-candidate.mjs', 'examples/recoverable-task.mjs',
-  'examples/lease-and-idempotency.mjs', 'examples/quality-gate.mjs',
+  'examples/lease-and-idempotency.mjs', 'examples/quality-gate.mjs', 'examples/cross-process.mjs',
   'scripts/check-publication.mjs'
 ]);
 const problems = [];

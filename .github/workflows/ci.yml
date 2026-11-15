@@ -14,6 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        node: ['22', '24']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
@@ -22,9 +23,10 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
           package-manager-cache: false
       - run: npm test
       - run: npm run demo
       - run: node examples/quality-gate.mjs
+      - run: node examples/cross-process.mjs
       - run: npm run check:publication
