@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import path from 'node:path';
 import { FileCheckpointStore, GoalRecoveryCoordinator } from '../src/index.mjs';
-import { temporaryDirectory } from './helpers.mjs';
+import { deferred, temporaryDirectory } from './helpers.mjs';
 
 test('new store instance recovers a persisted checkpoint and reconciles each job', async t => {
   const directory = await temporaryDirectory(t);
@@ -62,4 +64,197 @@ test('oversized checkpoint reads fail closed', async t => {
   const store = new FileCheckpointStore(await temporaryDirectory(t));
   await writeFile(store.file, 'x'.repeat(1024 * 1024 + 1));
   assert.equal((await new GoalRecoveryCoordinator({ store }).recover()).recoveryError, 'CHECKPOINT_UNREADABLE');
+});
+
+const sha256 = text => createHash('sha256').update(text).digest('hex');
+
+test('conditional saves replace only the revision the caller last read', async t => {
+  const store = new FileCheckpointStore(await temporaryDirectory(t));
+  assert.equal(await store.read(), null);
+  const created = await store.save({ step: 1 }, { expectedRevision: null }); // create-only
+  assert.equal(created.revision, sha256(await readFile(store.file, 'utf8')));
+  assert.deepEqual(await store.read(), { value: { step: 1 }, revision: created.revision });
+  await assert.rejects(store.save({ step: 'again' }, { expectedRevision: null }),
+    error => error.code === 'CHECKPOINT_CONFLICT' && error.currentRevision === created.revision);
+
+  const second = await store.save({ step: 2 }, { expectedRevision: created.revision });
+  const stale = await store.save({ step: 'stale' }, { expectedRevision: created.revision }).catch(error => error);
+  assert.equal(stale.code, 'CHECKPOINT_CONFLICT');
+  assert.deepEqual([stale.expectedRevision, stale.currentRevision], [created.revision, second.revision]);
+  assert.deepEqual(await store.load(), { step: 2 });
+
+  // Unconditional saves keep their previous behaviour.
+  assert.match((await store.save({ step: 3 })).revision, /^[0-9a-f]{64}$/);
+  for (const invalid of ['abc', 5, {}]) assert.throws(() => store.save({}, { expectedRevision: invalid }), TypeError);
+  assert.deepEqual(await readdir(store.directory), ['checkpoint.json']);
+});
+
+test('checkpoint revisions distinguish stored bytes even if they decode to identical text', async t => {
+  const store = new FileCheckpointStore(await temporaryDirectory(t));
+  const firstBytes = Buffer.from([0x22, 0x80, 0x22]);
+  const secondBytes = Buffer.from([0x22, 0x81, 0x22]);
+  await writeFile(store.file, firstBytes);
+  const first = await store.read();
+  assert.equal(first.revision, sha256(firstBytes));
+  await writeFile(store.file, secondBytes);
+  const second = await store.read();
+  assert.equal(second.value, first.value);
+  assert.equal(second.revision, sha256(secondBytes));
+  await assert.rejects(store.save({ stale: true }, { expectedRevision: first.revision }),
+    error => error.code === 'CHECKPOINT_CONFLICT' && error.currentRevision === second.revision);
+});
+
+test('a stale coordinator cannot overwrite the checkpoint of the one that took over', async t => {
+  const directory = await temporaryDirectory(t);
+  const original = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  const saved = await original.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id: 'attempt_1' }] });
+  const seenByOld = (await original.recover()).checkpointRevision;
+  assert.equal(seenByOld, saved.checkpointRevision);
+
+  const successor = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  const recovered = await successor.recover();
+  const next = await successor.checkpoint({ goal: recovered.goal, activeJobs: [{ id: 'attempt_2' }],
+    expectedRevision: recovered.checkpointRevision });
+
+  await assert.rejects(original.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [], expectedRevision: seenByOld }),
+    error => error.code === 'CHECKPOINT_CONFLICT' && error.currentRevision === next.checkpointRevision);
+  const final = await successor.recover();
+  assert.deepEqual(final.activeJobs, [{ id: 'attempt_2' }]);
+  assert.equal(final.checkpointRevision, next.checkpointRevision);
+
+  // An invalid checkpoint still reports its revision so it can be replaced conditionally.
+  await writeFile(path.join(directory, 'checkpoint.json'), '{"version":2}');
+  const invalid = await successor.recover();
+  assert.equal(invalid.recoveryError, 'CHECKPOINT_INVALID');
+  assert.equal(invalid.checkpointRevision, sha256('{"version":2}'));
+  await successor.checkpoint({ goal: { goalId: 'goal' }, expectedRevision: invalid.checkpointRevision });
+});
+
+test('custom stores keep working, but cannot silently ignore a revision condition', async () => {
+  let stored = null;
+  const plain = { save: async value => { stored = structuredClone(value); }, load: async () => structuredClone(stored) };
+  const coordinator = new GoalRecoveryCoordinator({ store: plain });
+  const saved = await coordinator.checkpoint({ goal: { goalId: 'goal' } });
+  assert.equal('checkpointRevision' in saved, false);
+  assert.equal('checkpointRevision' in await coordinator.recover(), false);
+  await assert.rejects(coordinator.checkpoint({ goal: { goalId: 'goal' }, expectedRevision: 'f'.repeat(64) }),
+    /does not support conditional saves/);
+});
+
+test('checkpoints written by earlier versions are read and replaced conditionally', async t => {
+  const directory = await temporaryDirectory(t);
+  const legacy = JSON.stringify({ version: 1, goal: { goalId: 'old' }, dag: null, activeJobs: [], checkpointedAt: '2026-01-01T00:00:00.000Z' }, null, 2) + '\n';
+  await writeFile(path.join(directory, 'checkpoint.json'), legacy);
+  await writeFile(path.join(directory, `${'a'.repeat(32)}.tmp`), '{"crashed');
+  await writeFile(path.join(directory, `${randomUUID()}.checkpoint.tmp`), '{"crashed');
+  const unrelated = 'notes.checkpoint.tmp';
+  await writeFile(path.join(directory, unrelated), 'keep me');
+  const store = new FileCheckpointStore(directory);
+  const { revision } = await store.read();
+  assert.equal(revision, sha256(legacy));
+  assert.equal((await new GoalRecoveryCoordinator({ store }).recover()).goal.goalId, 'old');
+  await store.save({ replaced: true }, { expectedRevision: revision });
+  assert.deepEqual((await readdir(directory)).sort(), ['checkpoint.json', unrelated]);
+  assert.equal(await readFile(path.join(directory, unrelated), 'utf8'), 'keep me');
+});
+
+test('by default a coordinator only replaces the checkpoint it last saw', async t => {
+  const directory = await temporaryDirectory(t);
+  const stale = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  await stale.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id: 'attempt_1' }] });
+
+  const successor = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  const recovered = await successor.recover();
+  await successor.checkpoint({ goal: recovered.goal, activeJobs: [{ id: 'attempt_2' }] }); // no revision passed
+
+  // The stale coordinator passes nothing either, and is still refused.
+  await assert.rejects(stale.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [] }), error => error.code === 'CHECKPOINT_CONFLICT');
+  await assert.rejects(stale.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [] }), error => error.code === 'CHECKPOINT_CONFLICT');
+  assert.deepEqual((await successor.recover()).activeJobs, [{ id: 'attempt_2' }]);
+
+  // After recovering (and reconciling) it may save again.
+  await stale.recover();
+  await stale.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id: 'attempt_3' }] });
+  assert.deepEqual((await successor.recover()).activeJobs, [{ id: 'attempt_3' }]);
+});
+
+test('a coordinator that has seen no checkpoint may only create one', async t => {
+  const directory = await temporaryDirectory(t);
+  const first = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  assert.equal(first.lastKnownRevision, undefined);
+  assert.equal(await first.recover(), null);
+  assert.equal(first.lastKnownRevision, null); // known to be absent
+  const saved = await first.checkpoint({ goal: { goalId: 'goal' } });
+  assert.equal(first.lastKnownRevision, saved.checkpointRevision);
+
+  // A fresh coordinator must not silently replace a checkpoint it never read.
+  const fresh = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  await assert.rejects(fresh.checkpoint({ goal: { goalId: 'other' } }),
+    error => error.code === 'CHECKPOINT_CONFLICT' && error.expectedRevision === null && error.currentRevision === saved.checkpointRevision);
+  assert.equal((await fresh.recover()).goal.goalId, 'goal');
+  await fresh.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id: 'next' }] });
+});
+
+test('unconditional saves are an explicit opt-out, and cannot be combined with a revision', async t => {
+  const directory = await temporaryDirectory(t);
+  const store = new FileCheckpointStore(directory);
+  await new GoalRecoveryCoordinator({ store }).checkpoint({ goal: { goalId: 'goal' } });
+  // Repair path: the checkpoint is unreadable, so its revision cannot be learned by recovering.
+  await writeFile(store.file, '{"corrupt');
+  const repair = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  assert.equal((await repair.recover()).recoveryError, 'CHECKPOINT_UNREADABLE');
+  await assert.rejects(repair.checkpoint({ goal: { goalId: 'goal' } }), error => error.code === 'CHECKPOINT_CONFLICT');
+  const replaced = await repair.checkpoint({ goal: { goalId: 'goal' }, unconditional: true });
+  assert.equal((await repair.recover()).checkpointRevision, replaced.checkpointRevision);
+  await assert.rejects(repair.checkpoint({ goal: { goalId: 'goal' }, unconditional: true, expectedRevision: null }), /either expectedRevision or unconditional/);
+  await assert.rejects(repair.checkpoint({ goal: { goalId: 'goal' }, unconditional: 'yes' }), /must be a boolean/);
+});
+
+test('overlapping checkpoints from one coordinator are applied in order without false conflicts', async t => {
+  const directory = await temporaryDirectory(t);
+  const coordinator = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
+  const saves = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+    coordinator.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id: `job_${index}` }] })));
+  assert.equal(new Set(saves.map(save => save.checkpointRevision)).size, 8);
+  const final = await coordinator.recover();
+  assert.deepEqual(final.activeJobs, [{ id: 'job_7' }]);
+  assert.equal(final.checkpointRevision, saves.at(-1).checkpointRevision);
+});
+
+test('overlapping recoveries require the revision of the snapshot being saved', async t => {
+  const directory = await temporaryDirectory(t);
+  const store = new FileCheckpointStore(directory);
+  const writer = new GoalRecoveryCoordinator({ store });
+  const inspectionStarted = deferred();
+  const finishInspection = deferred();
+  const coordinator = new GoalRecoveryCoordinator({
+    store: new FileCheckpointStore(directory),
+    jobInspector: async () => {
+      inspectionStarted.resolve();
+      await finishInspection.promise;
+      return { status: 'COMPLETED' };
+    }
+  });
+  const old = await writer.checkpoint({ goal: { goalId: 'goal', state: 'old' }, activeJobs: [{ id: 'old_job' }] });
+  const delayed = coordinator.recover();
+  t.after(() => finishInspection.resolve());
+  await inspectionStarted.promise;
+  const current = await writer.checkpoint({ goal: { goalId: 'goal', state: 'current' } });
+  const newest = await coordinator.recover();
+  assert.equal(newest.checkpointRevision, current.checkpointRevision);
+  await assert.rejects(coordinator.checkpoint({ goal: newest.goal }), { code: 'CHECKPOINT_REVISION_REQUIRED' });
+  const explicit = await coordinator.checkpoint({ goal: newest.goal, expectedRevision: newest.checkpointRevision });
+
+  finishInspection.resolve();
+  const earlier = await delayed;
+  assert.equal(earlier.checkpointRevision, old.checkpointRevision);
+  assert.equal(coordinator.lastKnownRevision, explicit.checkpointRevision);
+  const stale = { goal: earlier.goal, activeJobs: earlier.activeJobs };
+  await assert.rejects(coordinator.checkpoint(stale), { code: 'CHECKPOINT_REVISION_REQUIRED' });
+  await assert.rejects(coordinator.checkpoint({ ...stale, expectedRevision: earlier.checkpointRevision }), { code: 'CHECKPOINT_CONFLICT' });
+  assert.equal((await store.load()).goal.state, 'current');
+
+  const recovered = await coordinator.recover();
+  await coordinator.checkpoint({ goal: { ...recovered.goal, state: 'next' } });
+  assert.equal((await store.load()).goal.state, 'next');
 });
