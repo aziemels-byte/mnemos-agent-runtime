@@ -1,72 +1,98 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { PhaseJobRegistry, FileCheckpointStore, GoalRecoveryCoordinator } from '../src/index.mjs';
+import { FileCheckpointStore, FilePhaseJobRegistry, GoalRecoveryCoordinator } from '../src/index.mjs';
 
 const executeFile = promisify(execFile);
+const windows = process.platform === 'win32';
+
+// The job's command: it starts a grandchild and records both process IDs, then runs until stopped.
+const treeCommand = pidsFile => `
+  const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+  child.once('spawn', () => require('node:fs').writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify([process.pid, child.pid])));
+  setInterval(() => {}, 1000);`;
+
+const running = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
+
+async function recordedPids(pidsFile) {
+  for (const deadline = Date.now() + 15_000; Date.now() < deadline; await sleep(20)) {
+    try { return JSON.parse(await readFile(pidsFile, 'utf8')); } catch { /* not written yet */ }
+  }
+  throw new Error('The example command did not start');
+}
 
 async function recoverInNewProcess(directory) {
-  const receipt = JSON.parse(await readFile(path.join(directory, 'receipt.json'), 'utf8'));
-  const coordinator = new GoalRecoveryCoordinator({
-    store: new FileCheckpointStore(directory),
-    jobInspector: async job => ({ status: job.id === receipt.jobId ? receipt.status : 'UNKNOWN' })
-  });
+  // A fresh process: everything it knows comes from the checkpoint and the job records.
+  const jobs = new FilePhaseJobRegistry({ directory, execute: async () => { throw new Error('recovery never runs a job'); } });
+  const coordinator = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory), jobInspector: jobs.jobInspector() });
   const recovery = await coordinator.recover();
-  assert.equal(recovery.jobs[0].recoveryStatus, 'CANCELLED');
+  const [attempt] = recovery.jobs;
   assert.equal(recovery.recoveryRequired, true);
 
-  // The example's explicit policy authorizes a new attempt only after reconciliation.
-  // Exclusive creation prevents a repeated example attempt from duplicating this effect.
+  // The example's resume policy. A confirmed cancellation may be retried under a new job ID.
+  // An uncertain one (Windows cannot verify a process tree) is reconciled first, with
+  // evidence this process checks itself: the recorded process IDs no longer exist.
+  let reconciled = false;
+  if (attempt.recoveryStatus === 'UNKNOWN') {
+    const pids = JSON.parse(await readFile(path.join(directory, 'pids.json'), 'utf8'));
+    assert.ok(pids.every(pid => !running(pid)), 'the recorded processes still run: nothing may be retried');
+    const job = await jobs.get(attempt.id);
+    await jobs.reconcile({ jobId: attempt.id, expectedSequence: job.sequence, disposition: 'CANCELLED', explicitAuthorization: true,
+      evidence: { authoritative: true, source: 'example: the recorded process IDs no longer exist' } });
+    reconciled = true;
+  } else {
+    assert.equal(attempt.recoveryStatus, 'CANCELLED');
+  }
+
+  // The retry: a new job ID. Exclusive creation prevents a repeated example run from duplicating the effect.
   const report = path.join(directory, 'report.txt');
-  await writeFile(report, 'Recovered example task completed.\n', { flag: 'wx' });
-  await coordinator.checkpoint({ goal: recovery.goal, dag: recovery.dag, activeJobs: [] });
+  const retry = new FilePhaseJobRegistry({ directory, execute: async () => {
+    await writeFile(report, 'Recovered example task completed.\n', { flag: 'wx' });
+    return { status: 'COMPLETED' };
+  } });
+  await retry.start({ jobId: 'example_attempt_2', objective: 'Create an example report' });
+  assert.equal((await retry.wait('example_attempt_2')).status, 'COMPLETED');
+  await coordinator.checkpoint({ goal: recovery.goal, dag: recovery.dag, activeJobs: [{ id: 'example_attempt_2' }] });
   const final = await coordinator.recover();
   assert.equal(final.recoveryRequired, false);
-  return { freshProcessRecovery: 'CANCELLED', explicitResume: true, reportCreated: true };
+  return { freshProcessRecovery: attempt.recoveryStatus, reconciled, explicitResume: true, reportCreated: true };
 }
 
 export async function runRecoveryDemo() {
   const parent = path.resolve(os.tmpdir());
   const directory = await mkdtemp(path.join(parent, 'mnemos-public-demo-'));
-  let entered;
-  const started = new Promise(resolve => { entered = resolve; });
-  let child;
+  const pidsFile = path.join(directory, 'pids.json');
+  let pids = [];
   try {
-    const registry = new PhaseJobRegistry({ execute: ({ signal, setPhase }) => new Promise((resolve, reject) => {
-      let killRequested = false;
-      child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
-      const abort = () => { killRequested = child.kill(); };
-      signal.addEventListener('abort', abort, { once: true });
-      child.once('error', reject);
-      child.once('spawn', () => {
-        setPhase('execution');
-        entered();
-        if (signal.aborted) abort();
-      });
-      child.once('close', code => {
-        signal.removeEventListener('abort', abort);
-        resolve(killRequested
-          ? { status: 'CANCELLED', termination: { confirmed: true } }
-          : { status: code === 0 ? 'COMPLETED' : 'FAILED' });
-      });
-    }) });
-    registry.start({ jobId: 'example_attempt_1', objective: 'Create an example report' });
-    await started;
-    const cancellation = await registry.requestCancellation('example_attempt_1', { timeoutMs: 10000 });
-    assert.equal(cancellation.status, 'CANCELLED');
-    assert.equal(cancellation.cancellationConfirmed, true);
-    await writeFile(path.join(directory, 'receipt.json'), JSON.stringify(cancellation));
+    // The job runs its command as a supervised process tree, recorded in the job before it starts.
+    const jobs = new FilePhaseJobRegistry({ directory, execute: ({ setPhase, runProcess }) => {
+      setPhase('execution');
+      return runProcess({ command: process.execPath, args: ['-e', treeCommand(pidsFile)], graceMs: 1000 });
+    } });
+    await jobs.start({ jobId: 'example_attempt_1', objective: 'Create an example report' });
+    pids = await recordedPids(pidsFile);
+
+    const cancellation = await jobs.requestCancellation('example_attempt_1', { timeoutMs: 20_000 });
+    // Verified here independently of the receipt: neither the command nor its grandchild runs.
+    for (const deadline = Date.now() + 10_000; pids.some(running) && Date.now() < deadline;) await sleep(20);
+    const treeStopped = !pids.some(running);
+    assert.ok(treeStopped, 'the process tree was stopped');
+    assert.equal(cancellation.status, windows ? 'UNKNOWN' : 'CANCELLED');
+    assert.equal(cancellation.cancellationConfirmed, !windows);
+    assert.equal(cancellation.processes.length, 1);
+
     const coordinator = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
     await coordinator.checkpoint({ goal: { goalId: 'example_report' }, dag: { nodes: ['report'] }, activeJobs: [{ id: 'example_attempt_1' }] });
-    const { stdout } = await executeFile(process.execPath, [fileURLToPath(import.meta.url), '--recover', directory], { timeout: 10000, windowsHide: true });
-    return { ownedChildStopped: true, checkpointPersisted: true, ...JSON.parse(stdout) };
+    const { stdout } = await executeFile(process.execPath, [fileURLToPath(import.meta.url), '--recover', directory], { timeout: 20_000, windowsHide: true });
+    return { ownedChildStopped: treeStopped, processTreeStopped: treeStopped, cancellationConfirmed: cancellation.cancellationConfirmed,
+      checkpointPersisted: true, ...JSON.parse(stdout) };
   } finally {
-    if (child && child.exitCode === null && child.signalCode === null) child.kill();
+    for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
     if (path.dirname(path.resolve(directory)) !== parent) throw new Error('Unsafe cleanup target');
     await rm(directory, { recursive: true, force: true });
   }

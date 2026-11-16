@@ -258,3 +258,92 @@ test('overlapping recoveries require the revision of the snapshot being saved', 
   await coordinator.checkpoint({ goal: { ...recovered.goal, state: 'next' } });
   assert.equal((await store.load()).goal.state, 'next');
 });
+
+test('a hung inspector times out as UNKNOWN and does not block later default saves', async t => {
+  const directory = await temporaryDirectory(t);
+  await new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) })
+    .checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id: 'hung' }, { id: 'done' }] });
+  const signals = [];
+  const coordinator = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory), inspectionTimeoutMs: 30,
+    jobInspector: (job, { signal }) => {
+      signals.push(signal);
+      return job.id === 'done' ? { status: 'COMPLETED' } : new Promise(() => {});
+    } });
+  const recovered = await coordinator.recover();
+  assert.deepEqual(recovered.jobs.map(job => [job.id, job.recoveryStatus, job.recoveryReason]),
+    [['hung', 'UNKNOWN', 'INSPECTION_TIMEOUT'], ['done', 'COMPLETED', undefined]]);
+  assert.equal(recovered.recoveryRequired, true);
+  assert.deepEqual(signals.map(signal => signal.aborted), [true, false]);
+  assert.equal(signals[0].reason.code, 'INSPECTION_TIMEOUT');
+  // The recovery settled, so the coordinator's default conditional save works again.
+  await coordinator.checkpoint({ goal: recovered.goal, activeJobs: [] });
+  assert.deepEqual((await coordinator.recover()).activeJobs, []);
+});
+
+test('the recovery budget bounds all inspections; uninspected jobs are UNKNOWN', async t => {
+  const store = new FileCheckpointStore(await temporaryDirectory(t));
+  const ids = Array.from({ length: 6 }, (_, index) => `job_${index}`);
+  await new GoalRecoveryCoordinator({ store }).checkpoint({ goal: { goalId: 'goal' }, activeJobs: ids.map(id => ({ id })) });
+  let calls = 0;
+  const coordinator = new GoalRecoveryCoordinator({ store, inspectionTimeoutMs: 10_000, recoveryTimeoutMs: 40,
+    jobInspector: () => { calls++; return new Promise(() => {}); } });
+  const started = performance.now();
+  const { jobs } = await coordinator.recover();
+  assert.ok(performance.now() - started < 5_000, 'recovery must not wait for the per-job timeout');
+  assert.ok(jobs.every(job => job.recoveryStatus === 'UNKNOWN'));
+  assert.equal(jobs[0].recoveryReason, 'INSPECTION_TIMEOUT');
+  assert.equal(jobs.at(-1).recoveryReason, 'RECOVERY_TIMEOUT');
+  assert.ok(calls < ids.length, 'jobs past the budget are not inspected');
+  assert.equal(jobs.filter(job => job.recoveryReason === 'RECOVERY_TIMEOUT').length, ids.length - calls);
+});
+
+test('inspection failures are UNKNOWN with a reason; inspector answers carry none', async t => {
+  const store = new FileCheckpointStore(await temporaryDirectory(t));
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+  const answers = {
+    throws: () => { throw new Error('offline'); },
+    rejects: async () => { throw new Error('offline'); },
+    getter: async () => ({ get status() { throw new Error('hostile'); } }),
+    odd: async () => ({ status: 'probably_done' }),
+    unknown: async () => ({ status: 'UNKNOWN' }),
+    stale: async () => ({ status: 'FAILED' })
+  };
+  await new GoalRecoveryCoordinator({ store }).checkpoint({ goal: { goalId: 'goal' },
+    activeJobs: Object.keys(answers).map(id => id === 'stale' ? { id, recoveryReason: 'INSPECTION_TIMEOUT' } : { id }) });
+  const { jobs } = await new GoalRecoveryCoordinator({ store, jobInspector: job => answers[job.id]() }).recover();
+  assert.deepEqual(jobs.map(job => [job.id, job.recoveryStatus, job.recoveryReason]), [
+    ['throws', 'UNKNOWN', 'INSPECTION_FAILED'], ['rejects', 'UNKNOWN', 'INSPECTION_FAILED'],
+    ['getter', 'UNKNOWN', 'INSPECTION_FAILED'], ['odd', 'UNKNOWN', 'INSPECTION_UNSUPPORTED_STATUS'],
+    ['unknown', 'UNKNOWN', undefined], ['stale', 'FAILED', undefined]]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(unhandled, []);
+});
+
+test('inspection time limits are validated', () => {
+  const store = { save() {}, load() {} };
+  for (const invalid of [0, -1, 1.5, '10', Infinity, 300_001]) {
+    assert.throws(() => new GoalRecoveryCoordinator({ store, inspectionTimeoutMs: invalid }), /inspectionTimeoutMs/);
+  }
+  for (const invalid of [0, 2.5, 3_600_001]) {
+    assert.throws(() => new GoalRecoveryCoordinator({ store, recoveryTimeoutMs: invalid }), /recoveryTimeoutMs/);
+  }
+  assert.equal(new GoalRecoveryCoordinator({ store }).inspectionTimeoutMs, 10_000);
+});
+
+test('every job ID a checkpoint accepts is a valid registry job ID', async t => {
+  const { PhaseJobRegistry } = await import('../src/index.mjs');
+  const registry = new PhaseJobRegistry({ execute: async () => ({ status: 'COMPLETED' }) });
+  const store = new FileCheckpointStore(await temporaryDirectory(t));
+  const coordinator = new GoalRecoveryCoordinator({ store });
+  for (const id of ['a', 'A_1', 'x'.repeat(128)]) {
+    await coordinator.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id }] });
+    assert.equal(registry.get(id), null); // valid ID, no such job
+  }
+  for (const id of ['', '_a', 'x'.repeat(129)]) {
+    await assert.rejects(coordinator.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id }] }), /Invalid checkpoint/);
+    assert.throws(() => registry.get(id), /Invalid job ID/);
+  }
+});

@@ -6,7 +6,7 @@ import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { FileCheckpointStore, FileResourceLeaseManager, GoalRecoveryCoordinator } from '../src/index.mjs';
-import { temporaryDirectory } from './helpers.mjs';
+import { temporaryDirectory, zombieProcess } from './helpers.mjs';
 
 // Child processes import the module directly; each gets its own store instance.
 const moduleUrl = new URL('../src/index.mjs', import.meta.url).href;
@@ -205,4 +205,22 @@ test('lease and checkpoint locks can share a directory without disturbing each o
   assert.deepEqual((await readdir(directory)).sort(), ['checkpoint.json', leaseClaim, 'leases.json'].sort());
   await leases.list();
   assert.deepEqual((await readdir(directory)).sort(), ['checkpoint.json', 'leases.json']);
+});
+
+test('a lock held by a process that exited but was not reaped is recovered', { skip: process.platform !== 'linux' }, async t => {
+  const directory = await temporaryDirectory(t);
+  const { pid, parentPid } = await zombieProcess(t);
+  const store = new FileCheckpointStore(directory, { lockTimeoutMs: 1000 });
+  const lockedBy = holder => writeFile(store.lockFile,
+    JSON.stringify({ token: randomUUID(), pid: holder, host: hostname(), lockedAt: new Date().toISOString() }));
+
+  await lockedBy(parentPid); // alive: never broken
+  assert.equal((await store.inspectLock()).holderState, 'ALIVE');
+  await assert.rejects(store.save({ blocked: true }), { code: 'CHECKPOINT_LOCK_TIMEOUT' });
+
+  await lockedBy(pid); // exited, only awaiting reaping: provably gone
+  assert.equal((await store.inspectLock()).holderState, 'DEAD');
+  await store.save({ recovered: true });
+  assert.deepEqual(await store.load(), { recovered: true });
+  assert.equal((await store.inspectLock()).status, 'UNLOCKED');
 });

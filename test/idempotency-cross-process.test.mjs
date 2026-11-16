@@ -6,7 +6,7 @@ import { readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { FileIdempotencyRegistry } from '../src/index.mjs';
-import { temporaryDirectory } from './helpers.mjs';
+import { temporaryDirectory, withTimeout } from './helpers.mjs';
 
 // Child processes import the module directly; each gets its own registry instance.
 const moduleUrl = new URL('../src/index.mjs', import.meta.url).href;
@@ -225,7 +225,7 @@ test('pending background writes never keep a finished process alive', async t =>
   const started = Date.now();
   const child = startChild(source, [directory, '']);
   t.after(() => child.kill('SIGKILL'));
-  const exit = await Promise.race([child.exited, new Promise(resolve => setTimeout(() => resolve('still running'), 5_000))]);
+  const exit = await withTimeout(child.exited, 5_000, 'still running').catch(error => error.message);
   assert.notEqual(exit, 'still running', 'the child was kept alive by retry timers');
   assert.equal(exit.code, 0);
   assert.equal(JSON.parse(exit.stdout), 'IDEMPOTENCY_UNKNOWN');

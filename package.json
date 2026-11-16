@@ -11,7 +11,7 @@
   },
   "exports": "./src/index.mjs",
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-timeout=120000 test/*.test.mjs",
     "demo": "node examples/run.mjs",
     "check:publication": "node scripts/check-publication.mjs"
   }

@@ -2,9 +2,14 @@ import { createHash } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import path from 'node:path';
 import { DirectoryLock, replaceFile } from './directory-lock.mjs';
+import { VALID_JOB_ID, VALID_PHASE } from './phase-job-registry.mjs';
 
 const MAX_BYTES = 1024 * 1024;
-const VALID_ID = /^[a-z0-9][a-z0-9_-]{0,127}$/i;
+const VALID_GOAL_ID = /^[a-z0-9][a-z0-9_-]{0,127}$/i;
+const KNOWN_STATUS = new Set(['COMPLETED', 'RUNNING', 'CANCELLED', 'FAILED', 'UNKNOWN']);
+const REASON = /^[A-Z][A-Z0-9_]{0,63}$/;
+const MAX_INSPECTION_TIMEOUT_MS = 300_000;
+const MAX_RECOVERY_TIMEOUT_MS = 3_600_000;
 const REVISION = /^[0-9a-f]{64}$/;
 const CHECKPOINT_TEMPORARY = /^(?:[0-9a-f]{32}\.tmp|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.checkpoint\.tmp)$/;
 const revisionOf = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -51,7 +56,7 @@ export class FileCheckpointStore {
             { code: 'CHECKPOINT_CONFLICT', expectedRevision, currentRevision });
         }
       }
-      await replaceFile(this.file, text, '.checkpoint.tmp');
+      await replaceFile(this.file, text, '.checkpoint.tmp', { syncDirectory: true });
       return { revision: revisionOf(text) };
     }));
     this.#writes = operation.catch(() => {});
@@ -96,11 +101,55 @@ export class FileCheckpointStore {
 
 function validCheckpoint(value) {
   return value?.version === 1 && typeof value.goal?.goalId === 'string' &&
-    VALID_ID.test(value.goal.goalId) && typeof value.checkpointedAt === 'string' &&
+    VALID_GOAL_ID.test(value.goal.goalId) && typeof value.checkpointedAt === 'string' &&
     Number.isFinite(Date.parse(value.checkpointedAt)) && Array.isArray(value.activeJobs) &&
     value.activeJobs.length <= 1000 && value.activeJobs.every(job =>
-      typeof job?.id === 'string' && VALID_ID.test(job.id)) &&
+      typeof job?.id === 'string' && VALID_JOB_ID.test(job.id)) &&
     new Set(value.activeJobs.map(job => job.id)).size === value.activeJobs.length;
+}
+
+// Checked only when saving: a checkpoint records which jobs belong to a goal. A
+// status or phase stored with a job is a hint for readers, never authoritative,
+// but new checkpoints may not store values no job can have. Older checkpoints
+// with such values still load.
+function validJobHints(activeJobs) {
+  return activeJobs.every(job => (job.status === undefined || KNOWN_STATUS.has(job.status)) &&
+    (job.phase === undefined || (typeof job.phase === 'string' && VALID_PHASE.test(job.phase))));
+}
+
+function boundedInteger(value, label, max) {
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new TypeError(`${label} must be an integer between 1 and ${max}`);
+  }
+  return value;
+}
+
+/**
+ * Ask the inspector about one job, for at most timeoutMs. The inspector gets an
+ * AbortSignal that aborts on timeout; an inspector that ignores it is abandoned,
+ * never awaited. Any failure is uncertainty, never permission to replay.
+ */
+function inspectJob(inspector, job, timeoutMs) {
+  const controller = new AbortController();
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      controller.abort(Object.assign(new Error('Job inspection timed out'), { code: 'INSPECTION_TIMEOUT' }));
+      resolve({ status: 'UNKNOWN', reason: 'INSPECTION_TIMEOUT' });
+    }, timeoutMs);
+    Promise.resolve()
+      .then(() => inspector(structuredClone(job), { signal: controller.signal }))
+      .then(inspection => {
+        // Throwing getters are inspection failures.
+        const status = inspection?.status;
+        if (!KNOWN_STATUS.has(status)) return resolve({ status: 'UNKNOWN', reason: 'INSPECTION_UNSUPPORTED_STATUS' });
+        const reason = typeof inspection.reason === 'string' && REASON.test(inspection.reason) ? inspection.reason : undefined;
+        // A retry is safe only on an explicit report for a job that did not complete.
+        const effectAbsent = inspection.effectAbsent === true && (status === 'FAILED' || status === 'CANCELLED');
+        resolve({ status, reason, effectAbsent });
+      })
+      .catch(() => resolve({ status: 'UNKNOWN', reason: 'INSPECTION_FAILED' }))
+      .finally(() => clearTimeout(timer));
+  });
 }
 
 function invalidRecovery(reason) {
@@ -115,13 +164,21 @@ export class GoalRecoveryCoordinator {
   #serial = Promise.resolve();
   #recovery;
 
-  constructor({ store, jobInspector = async () => ({ status: 'UNKNOWN' }) } = {}) {
+  /**
+   * inspectionTimeoutMs bounds each jobInspector call; recoveryTimeoutMs bounds
+   * all inspections of one recover(). A job whose inspection times out, or that
+   * is not inspected before the recovery budget runs out, is UNKNOWN.
+   */
+  constructor({ store, jobInspector = async () => ({ status: 'UNKNOWN' }),
+    inspectionTimeoutMs = 10_000, recoveryTimeoutMs = 120_000 } = {}) {
     if (typeof store?.save !== 'function' || typeof store?.load !== 'function') {
       throw new TypeError('A checkpoint store is required');
     }
     if (typeof jobInspector !== 'function') throw new TypeError('jobInspector must be a function');
     this.store = store;
     this.jobInspector = jobInspector;
+    this.inspectionTimeoutMs = boundedInteger(inspectionTimeoutMs, 'inspectionTimeoutMs', MAX_INSPECTION_TIMEOUT_MS);
+    this.recoveryTimeoutMs = boundedInteger(recoveryTimeoutMs, 'recoveryTimeoutMs', MAX_RECOVERY_TIMEOUT_MS);
   }
 
   /** The last observed or saved revision (undefined: none seen yet). */
@@ -147,6 +204,7 @@ export class GoalRecoveryCoordinator {
   async checkpoint({ goal, dag = null, activeJobs = [], expectedRevision, unconditional = false } = {}) {
     const value = structuredClone({ version: 1, goal, dag, activeJobs, checkpointedAt: new Date().toISOString() });
     if (!validCheckpoint(value)) throw new TypeError('Invalid checkpoint shape or duplicate job ID');
+    if (!validJobHints(value.activeJobs)) throw new TypeError('Invalid checkpoint job status or phase');
     if (unconditional !== false && unconditional !== true) throw new TypeError('unconditional must be a boolean');
     if (unconditional && expectedRevision !== undefined) throw new TypeError('Use either expectedRevision or unconditional, not both');
     const conditional = typeof this.store.read === 'function';
@@ -212,14 +270,19 @@ export class GoalRecoveryCoordinator {
     const withRevision = result => revision === undefined ? result : { ...result, checkpointRevision: revision };
     if (!validCheckpoint(value)) return withRevision(invalidRecovery('CHECKPOINT_INVALID'));
     const jobs = [];
-    const known = new Set(['COMPLETED', 'RUNNING', 'CANCELLED', 'FAILED', 'UNKNOWN']);
+    const deadline = performance.now() + this.recoveryTimeoutMs;
     for (const job of value.activeJobs) {
-      let status = 'UNKNOWN';
-      try {
-        const inspection = await this.jobInspector(structuredClone(job));
-        if (known.has(inspection?.status)) status = inspection.status;
-      } catch { /* Inspection failure is uncertainty, never permission to replay. */ }
-      jobs.push({ ...structuredClone(job), recoveryStatus: status });
+      const remaining = Math.floor(deadline - performance.now());
+      // recoveryReason: the inspector's reason, or why the inspection itself failed.
+      const { status, reason, effectAbsent = false } = remaining < 1
+        ? { status: 'UNKNOWN', reason: 'RECOVERY_TIMEOUT' }
+        : await inspectJob(this.jobInspector, job, Math.min(this.inspectionTimeoutMs, remaining));
+      const entry = { ...structuredClone(job), recoveryStatus: status, recoveryEffectAbsent: effectAbsent,
+        // A status stored in the checkpoint is only a hint; flag it when the inspection disagrees.
+        checkpointStatusStale: job.status !== undefined && job.status !== status };
+      if (reason) entry.recoveryReason = reason;
+      else delete entry.recoveryReason; // never echo a stale reason stored in the checkpoint
+      jobs.push(entry);
     }
     return withRevision({
       ...structuredClone(value), jobs,

@@ -4,15 +4,20 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-test('demonstrates actual regression, owned child termination and recovery in a fresh process', { timeout: 20000 }, async () => {
+test('demonstrates actual regression, process-tree termination and recovery in a fresh process', { timeout: 60000 }, async () => {
   const { stdout } = await promisify(execFile)(process.execPath,
-    [fileURLToPath(new URL('../examples/run.mjs', import.meta.url))], { timeout: 15000, windowsHide: true });
+    [fileURLToPath(new URL('../examples/run.mjs', import.meta.url))], { timeout: 50000, windowsHide: true });
   const result = JSON.parse(stdout);
   assert.equal(result.candidateVerification.realRegression, 'VERIFIED');
   assert.equal(result.candidateVerification.regressionRuns, 1);
-  assert.equal(result.checkpointRecovery.ownedChildStopped, true);
-  assert.equal(result.checkpointRecovery.freshProcessRecovery, 'CANCELLED');
-  assert.equal(result.checkpointRecovery.reportCreated, true);
+  const recovery = result.checkpointRecovery;
+  assert.equal(recovery.processTreeStopped, true, 'the command and its grandchild were stopped');
+  // Windows cannot verify a process tree: the cancellation stays uncertain and the demo reconciles it.
+  const windows = process.platform === 'win32';
+  assert.equal(recovery.cancellationConfirmed, !windows);
+  assert.equal(recovery.freshProcessRecovery, windows ? 'UNKNOWN' : 'CANCELLED');
+  assert.equal(recovery.reconciled, windows);
+  assert.equal(recovery.reportCreated, true);
 });
 
 test('worker processes share a lease, one effect and a checkpoint without conflicts being lost', { timeout: 90000 }, async () => {

@@ -368,6 +368,6 @@ export class FileResourceLeaseManager {
   async #save({ lastFencingToken, leases }) {
     const text = JSON.stringify({ schema: STATE_SCHEMA, lastFencingToken, leases }, null, 2) + '\n';
     if (Buffer.byteLength(text) > MAX_STATE_BYTES) throw new RangeError('Lease state exceeds 1 MiB');
-    await replaceFile(this.stateFile, text, '.state.tmp');
+    await replaceFile(this.stateFile, text, '.state.tmp', { syncDirectory: true });
   }
 }

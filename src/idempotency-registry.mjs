@@ -445,6 +445,6 @@ export class FileIdempotencyRegistry {
   async #write(record) {
     const text = JSON.stringify({ schema: RECORD_SCHEMA, record }, null, 2) + '\n';
     if (Buffer.byteLength(text) > MAX_RECORD_BYTES) throw new RangeError('Idempotency record exceeds 1 MiB');
-    await replaceFile(this.#file(record.key), text, '.record.tmp');
+    await replaceFile(this.#file(record.key), text, '.record.tmp', { syncDirectory: true });
   }
 }

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { link, mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -10,6 +11,8 @@ const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const TOKEN = new RegExp(`^${UUID_PATTERN}$`);
 const LOCK_NAME = /^[a-z0-9][a-z0-9._-]*\.lock$/;
 const TRANSIENT_RENAME = new Set(['EPERM', 'EACCES', 'EBUSY']);
+// Filesystems that cannot flush a directory report one of these; anything else is a real error.
+const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP', 'EISDIR', 'EBADF']);
 // Lock waiters' temporaries carry the PID in their name, so a file left empty by a
 // process killed between creating and writing it can still be attributed.
 const WAITER_TEMPORARY = new RegExp(`^${UUID_PATTERN}(?:\\.(\\d+))?\\.lock\\.tmp$`);
@@ -18,22 +21,127 @@ const lockError = (code, message, details = {}) => Object.assign(new Error(messa
 const ownerRecord = () => JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString() });
 const validToken = token => typeof token === 'string' && TOKEN.test(token);
 
+// Linux: a process that has exited but was not yet reaped by its parent (a
+// zombie, state Z; or X while being reaped) still answers kill(pid, 0). Under an
+// init that reaps slowly or never (for example a container without --init) it
+// would look alive indefinitely. True only for a definite zombie; any doubt
+// (no procfs, unreadable, unexpected format) keeps the process alive.
+function exitedButUnreaped(pid) {
+  const state = procStat(pid)?.[0];
+  return state === 'Z' || state === 'X';
+}
+
+// Linux: the fields of /proc/<pid>/stat after "pid (comm)", starting with the
+// state (field 3); comm may contain spaces and parentheses. Null when unavailable.
+function procStat(pid) {
+  if (process.platform !== 'linux') return null;
+  let stat;
+  try { stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); }
+  catch { return null; }
+  const end = stat.lastIndexOf(')');
+  return end < 0 ? null : stat.slice(end + 2).trim().split(' ');
+}
+
+const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const TICKS = /^\d{1,20}$/;
+let cachedBootId;
+function bootId() {
+  if (process.platform !== 'linux') return null;
+  if (cachedBootId === undefined) {
+    try {
+      const id = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      cachedBootId = BOOT_ID.test(id) ? id : null;
+    } catch { cachedBootId = null; }
+  }
+  return cachedBootId;
+}
+
+/**
+ * Who a process is, so that a later check can tell it from an unrelated
+ * process that reused its PID: { pid, host } and, on Linux, the boot ID and the
+ * process start time in clock ticks since boot (field 22 of /proc/<pid>/stat).
+ * Elsewhere only { pid, host }. Null when no such process is running.
+ */
+export function processIdentity(pid = process.pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new TypeError('Invalid PID');
+  if (pid !== process.pid) {
+    try { process.kill(pid, 0); }
+    catch (error) { if (error.code === 'ESRCH') return null; }
+  }
+  const identity = { pid, host: hostname() };
+  const fields = procStat(pid);
+  if (fields && ['Z', 'X'].includes(fields[0])) return null; // exited, awaiting reaping
+  const boot = bootId();
+  if (fields && boot && TICKS.test(fields[19] ?? '')) {
+    identity.bootId = boot;
+    identity.startTicks = fields[19];
+  }
+  return identity;
+}
+
+/**
+ * Whether the process an identity describes is still running:
+ * - ALIVE: the same process, verified by boot ID and start time.
+ * - DEAD: provably gone (PID gone or a zombie, the host rebooted, or the PID now
+ *   belongs to a process that started at another time).
+ * - UNVERIFIED: a process with this PID runs, but the identity has no start time
+ *   to compare (recorded elsewhere than Linux, or by an older version). It may be
+ *   the same process or an unrelated one: never signal it on this evidence.
+ * - OTHER_HOST, UNREADABLE: as processState().
+ */
+export function identityState(identity) {
+  const basic = processState(identity);
+  if (basic === 'OTHER_HOST' || basic === 'UNREADABLE') return basic;
+  const recorded = identity.bootId !== undefined || identity.startTicks !== undefined;
+  if (recorded && !(typeof identity.bootId === 'string' && BOOT_ID.test(identity.bootId) &&
+    typeof identity.startTicks === 'string' && TICKS.test(identity.startTicks))) return 'UNREADABLE';
+  if (recorded && bootId() !== null && identity.bootId !== bootId()) return 'DEAD'; // rebooted since
+  if (basic === 'DEAD') return 'DEAD';
+  const current = processIdentity(identity.pid);
+  if (current === null) return 'DEAD';
+  if (!recorded || current.startTicks === undefined) return 'UNVERIFIED';
+  return current.startTicks === identity.startTicks ? 'ALIVE' : 'DEAD';
+}
+
 // A process is provably gone only when it ran on this host and its PID no
-// longer exists. Anything else (other host, unreadable record, live or unknown
-// PID) is treated as live: a stuck lock is recoverable, a double grant is not.
+// longer exists, or it has exited and only awaits reaping. Anything else
+// (other host, unreadable record, live or unknown PID) is treated as live: a
+// stuck lock is recoverable, a double grant is not.
 export function processState(record) {
   if (!Number.isSafeInteger(record?.pid) || record.pid <= 0 || typeof record.host !== 'string') return 'UNREADABLE';
   if (record.host !== hostname()) return 'OTHER_HOST';
   if (record.pid === process.pid) return 'ALIVE';
-  try { process.kill(record.pid, 0); return 'ALIVE'; }
+  try { process.kill(record.pid, 0); }
   catch (error) { return error.code === 'ESRCH' ? 'DEAD' : 'ALIVE'; }
+  return exitedButUnreaped(record.pid) ? 'DEAD' : 'ALIVE';
+}
+
+/**
+ * Flush a directory's entries (creations, renames) to stable storage, so that a
+ * completed rename survives power loss. Windows cannot open a directory for
+ * flushing; there this relies on NTFS metadata journaling and is best effort.
+ */
+export async function syncDirectory(directory) {
+  if (process.platform === 'win32') return false;
+  let handle;
+  try {
+    handle = await open(directory, 'r');
+    await handle.sync();
+    return true;
+  } catch (error) {
+    if (DIRECTORY_SYNC_UNSUPPORTED.has(error.code)) return false;
+    throw error;
+  } finally {
+    await handle?.close();
+  }
 }
 
 /**
  * Write a flushed temporary file in the target's directory, then rename it over
  * the target. Readers see either the old or the new content, never a mix.
+ * With syncDirectory, the rename itself is flushed before this resolves.
  */
-export async function replaceFile(target, text, suffix) {
+export async function replaceFile(target, text, suffix, { syncDirectory: flushDirectory = false } = {}) {
   const temporary = path.join(path.dirname(target), `${randomUUID()}${suffix}`);
   let file;
   try {
@@ -51,6 +159,7 @@ export async function replaceFile(target, text, suffix) {
         await sleep(delay + Math.random() * 10);
       }
     }
+    if (flushDirectory) await syncDirectory(path.dirname(target));
   } finally {
     await file?.close();
     await rm(temporary, { force: true });
@@ -67,6 +176,7 @@ export async function replaceFile(target, text, suffix) {
  */
 export class DirectoryLock {
   #claim;
+  #parentsFlushed = false;
 
   constructor({ directory, name, timeoutMs = 5_000, timeoutCode = 'LOCK_TIMEOUT', ownedTemporary = () => false } = {}) {
     if (typeof directory !== 'string' || !directory.trim()) throw new TypeError('A lock directory is required');
@@ -205,8 +315,23 @@ export class DirectoryLock {
     }
   }
 
+  // Create the directory if needed. When this instance first sees it, or has just
+  // created it, flush its entry (and those of created parents) into their parents,
+  // so a power loss cannot drop the state directory itself.
+  async #ensureDirectory() {
+    const created = await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    if (this.#parentsFlushed && !created) return;
+    const parents = [];
+    for (let directory = this.directory; ; directory = path.dirname(directory)) {
+      parents.push(path.dirname(directory));
+      if (!created || directory === path.resolve(created) || path.dirname(directory) === directory) break;
+    }
+    for (const parent of parents.reverse()) await syncDirectory(parent);
+    this.#parentsFlushed = true;
+  }
+
   async #acquire() {
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await this.#ensureDirectory();
     const token = randomUUID();
     const record = JSON.stringify({ token, pid: process.pid, host: hostname(), lockedAt: new Date().toISOString() });
     const temporary = this.#temporary(token);
