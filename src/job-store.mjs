@@ -1,8 +1,11 @@
-import { createHash } from 'node:crypto';
-import { open, readdir } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { DirectoryLock, replaceFile } from './directory-lock.mjs';
-import { MAX_EVIDENCE_BYTES, RECONCILED_STATUSES, VALID_JOB_ID, VALID_PHASE, jsonInput } from './phase-job-registry.mjs';
+import { DirectoryLock, readBoundedFile, replaceFile } from './directory-lock.mjs';
+import { appendJobEvent, jobEvent, jobFileStem, readJobHistory, searchJobHistory } from './job-history.mjs';
+import { validIdentity } from './process-identity.mjs';
+import {
+  MAX_EVIDENCE_BYTES, RECONCILED_STATUSES, VALID_JOB_ID, VALID_PHASE, jobError, jsonInput, requireJobId
+} from './phase-job-registry.mjs';
 
 // Internal module: the durable record behind the file-backed job registry.
 // Not exported from index.mjs.
@@ -29,33 +32,16 @@ const MAX_PROCESSES = 64;
 const IDENTITY = ['jobId', 'objective', 'fingerprint', 'createdAt', 'owner', 'resumable', 'resumeOf'];
 const MAX_ATTEMPTS = 1000;
 
-const jobError = (code, message, details = {}) => Object.assign(new Error(message), { code, ...details });
 const invalidRecord = (message, details) => jobError('JOB_RECORD_INVALID', message, details);
 const isTimestamp = value => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const isBoolean = value => value === true || value === false;
-const fileName = jobId => `${createHash('sha256').update(jobId).digest('hex')}.job.json`;
+const fileName = jobId => `${jobFileStem(jobId)}.job.json`;
 
-function requireJobId(jobId) {
-  if (typeof jobId !== 'string' || !VALID_JOB_ID.test(jobId)) throw new TypeError('Invalid job ID');
-  return jobId;
-}
-
-const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const TICKS = /^\d{1,20}$/;
-
-// A process identity: { pid, host } and, on Linux, bootId and startTicks.
-// The latter are optional (other platforms, earlier versions) but never partial.
-function validIdentity(identity) {
-  const identified = identity?.bootId !== undefined || identity?.startTicks !== undefined;
-  return Number.isSafeInteger(identity?.pid) && identity.pid > 0 &&
-    typeof identity.host === 'string' && identity.host.length > 0 && identity.host.length <= 255 &&
-    (!identified || (typeof identity.bootId === 'string' && BOOT_ID.test(identity.bootId) &&
-      typeof identity.startTicks === 'string' && TICKS.test(identity.startTicks)));
-}
-
+// threadId is absent in records of earlier versions.
 function validOwner(owner) {
   return validIdentity(owner) &&
-    typeof owner.executionId === 'string' && owner.executionId.length > 0 && owner.executionId.length <= 128;
+    typeof owner.executionId === 'string' && owner.executionId.length > 0 && owner.executionId.length <= 128 &&
+    (owner.threadId === undefined || (Number.isSafeInteger(owner.threadId) && owner.threadId >= 0));
 }
 
 // Process trees a job started: [{ marker, supervisor, leader, recordedAt }].
@@ -290,7 +276,7 @@ export class FileJobStore {
     return this.#transaction(async () => {
       const existing = await this.read(jobId);
       if (existing) return { created: false, record: existing };
-      await this.#write(record);
+      await this.#write(record, null);
       return { created: true, record: structuredClone(record) };
     });
   }
@@ -333,8 +319,8 @@ export class FileJobStore {
       const record = this.#newRecord({ ...successor, objective: current.objective, fingerprint: current.fingerprint, resumable: true,
         resumeOf: { jobId, rootJobId: current.resumeOf?.rootJobId ?? jobId, attempt: (current.resumeOf?.attempt ?? 1) + 1 },
         progress: current.progress });
-      if (predecessor !== current) await this.#write(predecessor);
-      await this.#write(record);
+      if (predecessor !== current) await this.#write(predecessor, current);
+      await this.#write(record, null);
       return { predecessor: structuredClone(predecessor), successor: structuredClone(record), created: true };
     });
   }
@@ -370,12 +356,16 @@ export class FileJobStore {
       if (!MUTABLE.has(field)) throw invalidRecord(`Field cannot be changed: ${field}`, { jobId, field });
     }
     let patch;
+    let field = null;
     try {
       patch = structuredClone(changes);
-      if ('result' in patch) patch.result = jsonInput(patch.result); // stored canonically
-    if (patch.progress !== undefined) patch.progress = jsonInput(patch.progress);
+      // Stored canonically.
+      field = 'result';
+      if ('result' in patch) patch.result = jsonInput(patch.result);
+      field = 'progress';
+      if (patch.progress !== undefined) patch.progress = jsonInput(patch.progress);
     } catch {
-      throw invalidRecord('Job record changes must be plain JSON; use boundResult() for results', { jobId, field: 'result' });
+      throw invalidRecord('Job record changes must be plain JSON; use boundResult() for results', { jobId, field: field ?? 'changes' });
     }
     return this.#transaction(async () => {
       const current = await this.read(jobId);
@@ -393,7 +383,7 @@ export class FileJobStore {
       }
       const problem = recordProblem(next);
       if (problem) throw invalidRecord(`Invalid job record: ${problem}`, { jobId, field: problem });
-      await this.#write(next);
+      await this.#write(next, current);
       return structuredClone(next);
     });
   }
@@ -422,6 +412,20 @@ export class FileJobStore {
     return { records, invalid };
   }
 
+  /**
+   * One job's event history (see job-history.mjs): { jobId, events, complete,
+   * missing, unreadableLines }, or null when no record exists. Never takes the lock.
+   */
+  async history(jobId) {
+    const record = await this.read(jobId);
+    return record ? readJobHistory(this.directory, jobId, record.sequence) : null;
+  }
+
+  /** Events of all jobs matching the filters (see job-history.mjs). Never takes the lock. */
+  searchHistory(filters) {
+    return searchJobHistory(this.directory, filters);
+  }
+
   /** Read-only view of the store lock for operators; never takes the lock. */
   inspectLock() { return this.#lock.inspect(); }
 
@@ -440,20 +444,10 @@ export class FileJobStore {
   }
 
   async #readFile(file) {
-    let text;
-    try {
-      const handle = await open(file, 'r');
-      try {
-        const stat = await handle.stat();
-        if (!stat.isFile() || stat.size > MAX_RECORD_BYTES) {
-          throw jobError('JOB_STATE_INVALID', 'Job record is not a file of at most 128 KiB', { file });
-        }
-        text = await handle.readFile('utf8');
-      } finally { await handle.close(); }
-    } catch (error) {
-      if (error.code === 'ENOENT') return null;
-      throw error;
-    }
+    const bytes = await readBoundedFile(file, MAX_RECORD_BYTES,
+      () => jobError('JOB_STATE_INVALID', 'Job record is not a file of at most 128 KiB', { file }));
+    if (bytes === null) return null;
+    const text = bytes.toString('utf8');
     let stored;
     try { stored = JSON.parse(text); }
     catch { throw jobError('JOB_STATE_INVALID', 'Job record is not valid JSON; reconciliation required', { file }); }
@@ -464,9 +458,13 @@ export class FileJobStore {
     return stored.record;
   }
 
-  async #write(record) {
+  // Write the record, then append its event to the job's history, both under the
+  // caller's lock. previous is null for a new record. A failed append never fails
+  // the write: it shows as a gap in the history.
+  async #write(record, previous) {
     const text = JSON.stringify({ schema: JOB_RECORD_SCHEMA, record }) + '\n';
     if (Buffer.byteLength(text) > MAX_RECORD_BYTES) throw invalidRecord('Job record exceeds 128 KiB', { jobId: record.jobId });
     await replaceFile(path.join(this.directory, fileName(record.jobId)), text, '.job.tmp', { syncDirectory: true });
+    await appendJobEvent(this.directory, jobEvent(previous, record));
   }
 }

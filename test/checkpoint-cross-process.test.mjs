@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
-import { FileCheckpointStore, FileResourceLeaseManager, GoalRecoveryCoordinator } from '../src/index.mjs';
-import { temporaryDirectory, zombieProcess } from './helpers.mjs';
+import { FileCheckpointStore, FileIdempotencyRegistry, FilePhaseJobRegistry, FileResourceLeaseManager, GoalRecoveryCoordinator } from '../src/index.mjs';
+import { temporaryDirectory, until, zombieProcess } from './helpers.mjs';
 
 // Child processes import the module directly; each gets its own store instance.
 const moduleUrl = new URL('../src/index.mjs', import.meta.url).href;
@@ -44,13 +44,6 @@ async function runChildren(count, source, args) {
   return results.map(result => result.value);
 }
 
-async function until(predicate, label, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-}
 
 async function deadPid() {
   const exited = spawn(process.execPath, ['-e', '']);
@@ -223,4 +216,21 @@ test('a lock held by a process that exited but was not reaped is recovered', { s
   await store.save({ recovered: true });
   assert.deepEqual(await store.load(), { recovered: true });
   assert.equal((await store.inspectLock()).status, 'UNLOCKED');
+});
+
+test('a state path that is not a regular file fails closed in every store, never read as absent', async t => {
+  const directory = await temporaryDirectory(t);
+  const sha256 = text => createHash('sha256').update(text).digest('hex');
+  for (const name of ['checkpoint.json', 'leases.json', `${sha256('report:weekly')}.record.json`, `${sha256('job_1')}.job.json`]) {
+    await mkdir(path.join(directory, name));
+  }
+  const must = () => { throw new Error('must not run'); };
+  assert.equal((await new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) }).recover()).recoveryError,
+    'CHECKPOINT_UNREADABLE');
+  await assert.rejects(new FileResourceLeaseManager({ directory, nodeRegistry: { require: () => ({ trust: 'VERIFIED', status: 'AVAILABLE' }) } })
+    .list(), { code: 'LEASE_STATE_INVALID' });
+  await assert.rejects(new FileIdempotencyRegistry({ directory }).execute({ key: 'report:weekly', operation: must }),
+    { code: 'IDEMPOTENCY_STATE_INVALID' });
+  await assert.rejects(new FilePhaseJobRegistry({ directory, execute: must }).start({ jobId: 'job_1', objective: 'Never starts' }),
+    { code: 'JOB_STATE_INVALID' });
 });

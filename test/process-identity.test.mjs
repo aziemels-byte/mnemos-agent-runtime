@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { hostname } from 'node:os';
-import { identityState, processIdentity } from '../src/directory-lock.mjs';
+import { identityState, processIdentity } from '../src/process-identity.mjs';
 import { zombieProcess } from './helpers.mjs';
 
 const linux = process.platform === 'linux';

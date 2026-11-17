@@ -6,7 +6,7 @@ import { readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { FileIdempotencyRegistry } from '../src/index.mjs';
-import { temporaryDirectory, withTimeout } from './helpers.mjs';
+import { temporaryDirectory, until, withTimeout } from './helpers.mjs';
 
 // Child processes import the module directly; each gets its own registry instance.
 const moduleUrl = new URL('../src/index.mjs', import.meta.url).href;
@@ -39,13 +39,6 @@ async function runChild(source, args) {
   return JSON.parse(stdout);
 }
 
-async function until(predicate, label, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-}
 
 const lines = async file => (await readFile(file, 'utf8').catch(() => '')).split('\n').filter(Boolean);
 
@@ -168,7 +161,7 @@ test('another process can neither run nor reconcile a key while its owner is ali
   assert.equal(calls, 1);
 });
 
-test('an outcome that could not be recorded still reaches UNKNOWN while its owner keeps running', async t => {
+test('an outcome that could not be recorded at first is recorded while its owner keeps running', async t => {
   const directory = await temporaryDirectory(t);
   const lockFile = path.join(directory, 'idempotency.lock');
   // A holder that cannot be checked (another host) blocks the outcome write until it goes away.
@@ -185,10 +178,13 @@ test('an outcome that could not be recorded still reaches UNKNOWN while its owne
 
   await rm(lockFile); // the blocking holder is gone; this owner process is still running
   const observe = `emit(await registry.execute({ key: 'export:9', operation: () => { throw Error('must not execute'); } }));`;
-  await until(async () => (await registry.inspect('export:9')).state === 'UNKNOWN', 'the outcome to be recorded as UNKNOWN', 5_000);
-  assert.equal((await registry.inspect('export:9')).reason, 'COMPLETION_PERSISTENCE_FAILED');
-  // Another process sees UNKNOWN, not a key stuck IN_PROGRESS for this process's lifetime.
-  assert.equal((await runChild(observe, [directory, ''])).status, 'IDEMPOTENCY_UNKNOWN');
+  // The outcome this owner knows is written in the background, not downgraded to UNKNOWN.
+  await until(async () => (await registry.inspect('export:9')).state !== 'STARTED', 'the outcome to be recorded', 5_000);
+  const recorded = await registry.inspect('export:9');
+  assert.deepEqual([recorded.state, recorded.result], ['COMPLETED', 'exported']);
+  // Another process sees the result, not a key stuck IN_PROGRESS for this process's lifetime.
+  const seen = await runChild(observe, [directory, '']);
+  assert.deepEqual([seen.status, seen.result], ['IDEMPOTENT_REPLAY', 'exported']);
   assert.equal(calls, 1);
 });
 

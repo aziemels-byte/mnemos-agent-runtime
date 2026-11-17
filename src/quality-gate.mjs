@@ -148,20 +148,44 @@ export class QualityFloorPolicy {
 }
 
 /**
- * Integrated fail-closed review. A positive result means "eligible for human
- * review", not verified production safety, automatic merge or deployment.
+ * Integrated fail-closed review. Check results are never taken from the caller:
+ * each required check names its evidence (an evidence ID from TestEvidence.run),
+ * which the gate resolves from the job records and verifies for this `subject`
+ * (what was checked, for example a hash of the candidate's diff). A positive
+ * result means "eligible for human review", not verified production safety,
+ * automatic merge or deployment.
+ *
+ *   await new QualityGate({ evidence }).review({ definition, subject,
+ *     checks: { unit: evidenceId, ... }, baseline, candidate })
  */
 export class QualityGate {
-  constructor() {
+  constructor({ evidence } = {}) {
+    if (typeof evidence?.verify !== 'function') throw new TypeError('QualityGate needs an evidence store (TestEvidence) to verify checks');
+    this.evidence = evidence;
     this.policyGate = new IsolatedSelfModificationGate();
     this.evaluationGate = new AutomatedEvaluationGate();
     this.comparisonGate = new CandidateComparisonGate();
     this.qualificationGate = new QualificationGate();
   }
 
-  review({ definition, checks, baseline, candidate, qualification, requireQualification = false } = {}) {
+  /**
+   * checks: { <category>: evidenceId } (or { evidenceId }) for every required
+   * category. evaluations.evidence reports, per category, whether its evidence
+   * was verified and why not.
+   */
+  async review({ definition, subject, checks, baseline, candidate, qualification, requireQualification = false } = {}) {
     const policy = this.policyGate.authorize(definition);
-    const evaluations = this.evaluationGate.evaluate(checks);
+    const receipts = {};
+    const evidence = {};
+    for (const category of REQUIRED_EVALUATIONS) {
+      const reference = checks?.[category];
+      const evidenceId = typeof reference === 'string' ? reference : reference?.evidenceId;
+      const verification = await this.evidence.verify({ category, subject, evidenceId });
+      evidence[category] = { evidenceId: evidenceId ?? null, verified: verification.verified, reason: verification.reason,
+        passed: verification.verified && verification.receipt.passed };
+      if (verification.verified) receipts[category] = verification.receipt;
+    }
+    const evaluations = { ...this.evaluationGate.evaluate(receipts), evidence };
     const comparison = this.comparisonGate.compare({ baseline, candidate });
     const qualificationResult = requireQualification ? this.qualificationGate.assess(qualification) : null;
     const status =

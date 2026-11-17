@@ -60,7 +60,7 @@ async function recoverInNewProcess(directory) {
   await coordinator.checkpoint({ goal: recovery.goal, dag: recovery.dag, activeJobs: [{ id: 'example_attempt_2' }] });
   const final = await coordinator.recover();
   assert.equal(final.recoveryRequired, false);
-  return { freshProcessRecovery: attempt.recoveryStatus, reconciled, explicitResume: true, reportCreated: true };
+  return { freshProcessRecovery: attempt.recoveryStatus, reconciled };
 }
 
 export async function runRecoveryDemo() {
@@ -89,8 +89,10 @@ export async function runRecoveryDemo() {
     const coordinator = new GoalRecoveryCoordinator({ store: new FileCheckpointStore(directory) });
     await coordinator.checkpoint({ goal: { goalId: 'example_report' }, dag: { nodes: ['report'] }, activeJobs: [{ id: 'example_attempt_1' }] });
     const { stdout } = await executeFile(process.execPath, [fileURLToPath(import.meta.url), '--recover', directory], { timeout: 20_000, windowsHide: true });
-    return { ownedChildStopped: treeStopped, processTreeStopped: treeStopped, cancellationConfirmed: cancellation.cancellationConfirmed,
-      checkpointPersisted: true, ...JSON.parse(stdout) };
+    // Checked here, not taken from the recovering process: its retry created the report.
+    const reportCreated = (await readFile(path.join(directory, 'report.txt'), 'utf8').catch(() => null)) !== null;
+    return { processTreeStopped: treeStopped, cancellationConfirmed: cancellation.cancellationConfirmed,
+      ...JSON.parse(stdout), reportCreated };
   } finally {
     for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
     if (path.dirname(path.resolve(directory)) !== parent) throw new Error('Unsafe cleanup target');

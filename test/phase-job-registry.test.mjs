@@ -180,7 +180,8 @@ test('outcomes carry a reason, and effectAbsent only from an explicit executor r
     failed_plain: async () => ({ status: 'FAILED' }),
     completed_claim: async () => ({ status: 'COMPLETED', effectAbsent: true }),
     threw: async () => { throw new Error('offline'); },
-    odd_status: async () => ({ status: 'CANCELLED' })
+    odd_status: async () => ({ status: 'CANCELLED' }),
+    unknown_report: async () => ({ status: 'UNKNOWN', effectAbsent: true }) // cannot tell; never effect-free
   };
   const registry = new PhaseJobRegistry({ execute: ({ jobId }) => reports[jobId]() });
   const outcomes = {};
@@ -194,7 +195,8 @@ test('outcomes carry a reason, and effectAbsent only from an explicit executor r
     failed_plain: ['FAILED', false, 'EXECUTOR_REPORTED_FAILURE'],
     completed_claim: ['COMPLETED', false, null],
     threw: ['FAILED', false, 'EXECUTOR_THREW'],
-    odd_status: ['FAILED', false, 'EXECUTOR_STATUS_UNEXPECTED']
+    odd_status: ['FAILED', false, 'EXECUTOR_STATUS_UNEXPECTED'],
+    unknown_report: ['UNKNOWN', false, 'EXECUTOR_REPORTED_UNKNOWN']
   });
 
   registry.start({ jobId: 'early', objective: 'Cancel before dispatch' });

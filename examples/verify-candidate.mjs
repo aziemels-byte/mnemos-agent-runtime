@@ -1,13 +1,8 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { createCandidateVerifier } from '../src/index.mjs';
-
-const executeFile = promisify(execFile);
+import { TestEvidence, createCandidateVerifier } from '../src/index.mjs';
 
 export async function runVerificationDemo() {
   const parent = path.resolve(os.tmpdir());
@@ -18,23 +13,19 @@ export async function runVerificationDemo() {
   let regressionRuns = 0;
   try {
     await writeFile(file, before);
+    // The candidate's test file (its import names the candidate's file, not one of this repository).
+    const specifier = JSON.stringify('./sum.mjs');
+    await writeFile(path.join(directory, 'sum.test.mjs'),
+      `import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { sum } from ${specifier};\ntest('adds', () => assert.equal(sum(2, 3), 5));\n`);
     // A real single-file adapter. Production adapters must enumerate ALL changed files.
     const workspace = {
       diff: async () => (await readFile(file, 'utf8')) === before ? '' : `-${before}+${await readFile(file, 'utf8')}`,
       changedFiles: async () => (await readFile(file, 'utf8')) === before ? [] : ['sum.mjs']
     };
-    const verify = createCandidateVerifier({ runRegression: async ({ signal }) => {
-      regressionRuns++;
-      const source = `import assert from 'node:assert/strict'; import {sum} from ${JSON.stringify(pathToFileURL(file).href)}; assert.equal(sum(2, 3), 5);`;
-      try {
-        await executeFile(process.execPath, ['--input-type=module', '-e', source], { signal, timeout: 5000, windowsHide: true });
-        return { passed: true, exitCode: 0 };
-      } catch (error) {
-        // This adapter does not prove child termination after abort; keep it unconfirmed.
-        if (signal?.aborted) return { cancelled: true, termination: { confirmed: false } };
-        return { passed: false, exitCode: typeof error.code === 'number' ? error.code : 1 };
-      }
-    } });
+    // The regression suite runs as a recorded check; its record is the evidence.
+    const evidence = new TestEvidence({ directory: path.join(directory, 'state') });
+    const runner = evidence.regressionRunner({ command: process.execPath, args: ['--test', 'sum.test.mjs'], cwd: directory });
+    const verify = createCandidateVerifier({ runRegression: async context => { regressionRuns++; return runner(context); } });
     const empty = await verify({ workspace, allowedFiles: ['sum.mjs'] });
     assert.equal(empty.status, 'REJECTED');
     assert.equal(regressionRuns, 0);
@@ -42,7 +33,11 @@ export async function runVerificationDemo() {
     const verified = await verify({ workspace, allowedFiles: ['sum.mjs'] });
     assert.equal(verified.status, 'VERIFIED');
     assert.equal(regressionRuns, 1);
-    return { emptyCandidate: 'REJECTED', realRegression: 'VERIFIED', regressionRuns };
+    // What QualityGate does with it: resolve the evidence from the records, for this candidate.
+    const evidenceCheck = await evidence.verify({ category: 'regression', subject: verified.subject, evidenceId: verified.evidenceId });
+    assert.equal(evidenceCheck.verified && evidenceCheck.receipt.passed, true);
+    return { emptyCandidate: 'REJECTED', realRegression: 'VERIFIED', regressionRuns, evidenceVerified: true,
+      testsRun: evidenceCheck.receipt.summary.tests };
   } finally {
     if (path.dirname(path.resolve(directory)) !== parent) throw new Error('Unsafe cleanup target');
     await rm(directory, { recursive: true, force: true });

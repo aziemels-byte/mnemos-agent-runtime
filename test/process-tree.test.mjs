@@ -1,16 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { identityState, processIdentity } from '../src/directory-lock.mjs';
+import { identityState, processIdentity } from '../src/process-identity.mjs';
 import { runSupervised, spawnSupervised } from '../src/process-tree.mjs';
 import { FilePhaseJobRegistry, PhaseJobRegistry } from '../src/index.mjs';
 import { FileJobStore } from '../src/job-store.mjs';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import { hostname } from 'node:os';
-import { temporaryDirectory, withTimeout } from './helpers.mjs';
+import { temporaryDirectory, until, withTimeout } from './helpers.mjs';
 
 const posix = process.platform !== 'win32';
 const linux = process.platform === 'linux';
@@ -76,14 +77,9 @@ function markedProcesses(marker) {
   return found;
 }
 
-async function until(predicate, label, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-    await sleep(20);
-  }
-}
 const gone = identity => identityState(identity) === 'DEAD';
+// Linux: the parent PID of a running process (null once it is gone).
+const parentOf = pid => { try { const stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]); } catch { return null; } };
 
 // An owning process that starts a supervised tree, reports the PIDs and then
 // runs `then` (by default: stays alive until killed).
@@ -192,10 +188,17 @@ test('members left in the group after the command ended are stopped when the own
   const source = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify('console.log(process.pid);' + forever)}],
     { stdio: ['ignore', 'inherit', 'ignore'] }); setTimeout(() => process.exit(0), 200);`;
   // Like any piped child stream, tree.stdout keeps the owner alive until it is closed.
-  const owner = startOwner(t, { source, then: 'tree.exited.then(() => { report({ exited: true }); tree.stdout.destroy(); });' });
+  // The owner checks the grandchild itself before it closes the stream and exits: once
+  // it exits, its supervisor stops the grandchild, so a later check here would race.
+  const owner = startOwner(t, { source, then: `tree.exited.then(() => {
+    let grandchildRuns = true;
+    try { process.kill(Number(String(data).trim()), 0); } catch { grandchildRuns = false; }
+    report({ exited: true, grandchildRuns });
+    tree.stdout.destroy();
+  });` });
   const tree = await ownerTree(t, owner);
-  assert.deepEqual(await owner.output(), { exited: true });
-  assert.ok(gone(tree.leader) && !gone(tree.grandchild), 'the leader ended, its grandchild runs on');
+  assert.deepEqual(await owner.output(), { exited: true, grandchildRuns: true }, 'the leader ended, its grandchild runs on');
+  assert.ok(gone(tree.leader));
   assert.equal(await owner.closed(), 0, 'the owner can exit normally once the command ended');
   await until(() => gone(tree.grandchild) && gone(tree.supervisor), 'the leftover member to be stopped');
 });
@@ -272,6 +275,8 @@ test('spawn failures and invalid options are reported', async () => {
   await assert.rejects(spawnSupervised(process.execPath, [], { stdio: 'overlapped' }), /stdio/);
   await assert.rejects(spawnSupervised(process.execPath, [], { beforeStart: 'yes' }), /beforeStart/);
   await assert.rejects(spawnSupervised(process.execPath, [], { orphanGraceMs: -1 }), /orphanGraceMs/);
+  await assert.rejects(spawnSupervised(process.execPath, [], { cwd: 5 }), /cwd/);
+  await assert.rejects(spawnSupervised(process.execPath, [], { env: 'X=1' }), /env/);
   const tree = await spawnSupervised(process.execPath, ['-e', '']);
   await tree.exited;
   for (const graceMs of [-1, 1.5, 60_001]) assert.throws(() => tree.terminate({ graceMs }), /graceMs/);
@@ -429,7 +434,9 @@ test('a detached descendant whose parent exited before any scan is found by its 
 
 test('limit: a descendant that clears its environment and detaches before any scan is not found', { skip: !linux }, async t => {
   const { tree, pids } = await startEscapingTree(t, { parentLivesMs: 100, escapeeClearsEnvironment: true }, { trackIntervalMs: 60_000 });
-  await until(() => gone(pids.parent), 'the parent to exit');
+  // The limit applies once the escapee has lost its parent link, which can happen after its parent
+  // already reports as exited (measured under load): wait for the link itself.
+  await until(() => gone(pids.parent) && parentOf(pids.escapee.pid) !== pids.parent.pid, 'the escapee to lose its parent link');
   const receipt = await tree.terminate({ graceMs: 2000 });
   assert.deepEqual([receipt.confirmed, receipt.tracked], [true, []], 'the receipt covers what could be found');
   assert.ok(!gone(pids.escapee), 'no parent link and no marker: nothing connects it to the tree');
@@ -450,6 +457,26 @@ function sleepers(duration) {
   return found;
 }
 
+// Linux: raw facts about processes that survived a termination, for the failure
+// message, so that a rare failure (see verify:reliability) leaves data behind.
+// Start times are in clock ticks since boot; uptime in seconds.
+const uptime = () => Number(readFileSync('/proc/uptime', 'utf8').split(' ')[0]);
+function survivorDiagnostics(pids, tree, receipt, uptimeAtStart) {
+  const processes = pids.map(pid => {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      let marker;
+      try { marker = readFileSync(`/proc/${pid}/environ`, 'latin1').split('\0').includes(`${receipt.marker}=1`); }
+      catch (error) { marker = error.code; }
+      return { pid, state: fields[0], ppid: Number(fields[1]), pgrp: Number(fields[2]), session: Number(fields[3]),
+        startTicks: fields[19], marker, inReceipt: receipt.tracked.some(entry => entry.pid === pid) };
+    } catch (error) { return { pid, error: error.code }; }
+  });
+  return JSON.stringify({ processes, leader: tree.pid, leaderStartTicks: tree.identity?.startTicks ?? null,
+    uptimeAtTerminate: uptimeAtStart, uptimeAtCheck: uptime(), receipt });
+}
+
 test('a process started by a SIGTERM handler during termination is found and stopped', { skip: !linux }, async t => {
   // The command ignores nothing, but on SIGTERM it starts a detached process, then exits.
   const duration = `29.${Date.now() % 100000}1`;
@@ -460,17 +487,25 @@ test('a process started by a SIGTERM handler during termination is found and sto
   const tree = await spawnSupervised(process.execPath, ['-e', source], { trackIntervalMs: 60_000 });
   t.after(() => { for (const pid of sleepers(duration)) kill(pid); kill(tree.pid); kill(tree.supervisor.pid); });
   await sleep(300); // the handler is installed
+  const uptimeAtStart = uptime();
   const receipt = await tree.terminate({ graceMs: 3000 });
   assert.equal(receipt.confirmed, true);
   await sleep(200);
-  assert.deepEqual(sleepers(duration), [], 'started after the last scan before the signals, and still stopped');
+  const survivors = sleepers(duration);
+  assert.deepEqual(survivors, [], survivors.length === 0 ? undefined
+    : `started after the last scan before the signals, and still stopped; ${survivorDiagnostics(survivors, tree, receipt, uptimeAtStart)}`);
 });
 
 test('processes started while the tree is being terminated cannot escape: the tree is frozen first', { skip: !linux }, async t => {
   // The command keeps starting detached processes that also clear their environment:
   // only their parent link connects them to the tree, and only while the parent runs.
+  // It ignores SIGTERM, so it keeps starting them through the grace period; the tree
+  // is frozen again before SIGKILL, so none can appear unseen before the kill.
+  // (A parent that exits during the grace period, after starting such a process,
+  // leaves it unreachable: the documented limit. Measured: a Node process sent
+  // SIGTERM and SIGCONT may still start children before it exits.)
   const duration = `28.${Date.now() % 100000}1`;
-  const spawner = `const { spawn } = require('node:child_process'); let count = 0;
+  const spawner = `const { spawn } = require('node:child_process'); let count = 0; ${ignoreTerm}
     const timer = setInterval(() => {
       if (count++ > 1500) return clearInterval(timer);
       spawn('sleep', [${JSON.stringify(duration)}], { stdio: 'ignore', detached: true, env: {} });
@@ -478,10 +513,13 @@ test('processes started while the tree is being terminated cannot escape: the tr
   const tree = await spawnSupervised(process.execPath, ['-e', spawner], { trackIntervalMs: 60_000 });
   t.after(() => { for (const pid of sleepers(duration)) kill(pid); kill(tree.pid); killGroup(tree.pid); kill(tree.supervisor.pid); });
   await until(() => sleepers(duration).length > 5, 'the spawner to start processes');
-  const receipt = await tree.terminate({ graceMs: 2000 });
-  assert.deepEqual([receipt.confirmed, receipt.frozen], [true, true]);
+  const uptimeAtStart = uptime();
+  const receipt = await tree.terminate({ graceMs: 1000 });
+  assert.deepEqual([receipt.confirmed, receipt.frozen, receipt.signals], [true, true, ['SIGTERM', 'SIGKILL']]);
   await sleep(200);
-  assert.deepEqual(sleepers(duration), [], 'no process of the tree survived');
+  const survivors = sleepers(duration);
+  assert.deepEqual(survivors, [], survivors.length === 0 ? undefined
+    : `no process of the tree survived; ${survivorDiagnostics(survivors, tree, receipt, uptimeAtStart)}`);
 });
 
 test('when the owner dies, descendants found only by their marker are stopped too', { skip: !linux }, async t => {
@@ -519,4 +557,87 @@ test('a cancelled job stops descendants that left its group', { skip: !linux }, 
   assert.deepEqual([cancelled.status, cancelled.cancellationConfirmed, cancelled.result.termination.coverage],
     ['CANCELLED', true, 'process-group+descendants']);
   assert.ok(gone(pids.escapee) && gone(pids.escapeeChild));
+});
+
+// An unconfirmed start (B1) and a supervisor that cannot be spawned (B2).
+
+test('a command whose start was not confirmed is UNKNOWN, never effect-free, and is stopped', { skip: !posix }, async t => {
+  const directory = await temporaryDirectory(t);
+  const effect = path.join(directory, 'effect');
+  const pidFile = path.join(directory, 'command.pid');
+  // Preloaded into the supervisor only (it inherits NODE_OPTIONS): it starts the
+  // command, then dies before it can report that the command started.
+  const preload = path.join(directory, 'die-after-start.cjs');
+  await writeFile(preload, `const send = process.send?.bind(process);
+if (send) process.send = (message, ...rest) => {
+  if (message?.type === 'started') process.kill(process.pid, 'SIGKILL');
+  return send(message, ...rest);
+};`);
+  t.after(async () => { try { kill(Number(await readFile(pidFile, 'utf8'))); } catch { /* never started */ } });
+  const jobs = new FilePhaseJobRegistry({ directory, execute: ({ runProcess }) => runProcess({ command: '/bin/sh',
+    args: ['-c', `echo $$ > '${pidFile}'; sleep 1; echo charged >> '${effect}'`] }) });
+  const previous = process.env.NODE_OPTIONS;
+  process.env.NODE_OPTIONS = `--require "${preload}"`;
+  let job;
+  try {
+    await jobs.start({ jobId: 'charge_1', objective: 'Charge once' });
+    job = await withTimeout(jobs.wait('charge_1'), 20_000, 'the job did not settle');
+  } finally {
+    if (previous === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previous;
+  }
+  const [{ marker }] = job.processes; // recorded before the go-ahead
+  t.after(() => { if (linux) for (const pid of markedProcesses(marker)) kill(pid); });
+  // The command may have started, so its effect may happen: a retry is not known to be safe.
+  assert.deepEqual([job.status, job.reason, job.effectAbsent, job.reconciliationRequired],
+    ['UNKNOWN', 'EXECUTOR_REPORTED_UNKNOWN', false, true]);
+  assert.equal(job.result.startUnconfirmed, true);
+  assert.equal(job.result.marker, marker);
+  // Linux can find the unsupervised command by its marker; it must not run on.
+  if (linux) {
+    assert.equal(job.result.termination.confirmed, true);
+    assert.deepEqual(markedProcesses(marker), [], 'the command was stopped');
+  }
+});
+
+test('a supervisor that cannot be spawned is reported as a start failure, never crashing its owner', { skip: !posix }, async () => {
+  // With few file descriptors, spawning the supervisor (pipes and IPC) fails with EMFILE.
+  const script = `
+    import { openSync } from 'node:fs';
+    import { runSupervised } from ${JSON.stringify(moduleUrl)};
+    const held = [];
+    try { for (;;) held.push(openSync('/dev/null', 'r')); } catch { /* no descriptor left */ }
+    const result = await runSupervised({ command: 'true' });
+    process.stdout.write(JSON.stringify(result));`;
+  const { stdout } = await promisify(execFile)('/bin/sh', ['-c', 'ulimit -n 64 && exec "$0" --input-type=module -e "$1"',
+    process.execPath, script], { timeout: 20_000 });
+  const result = JSON.parse(stdout);
+  // Nothing was started: this one is effect-free.
+  assert.deepEqual([result.status, result.effectAbsent], ['FAILED', true]);
+  assert.ok(['EMFILE', 'EAGAIN', 'ENFILE'].includes(result.spawnError), result.spawnError);
+});
+
+test('env is passed as child_process.spawn() would: undefined values left out, others as strings', async () => {
+  const check = 'process.exit(process.env.COUNT === "2" && process.env.BIG === "1" && !("GONE" in process.env) ? 0 : 7)';
+  const result = await runSupervised({ command: process.execPath, args: ['-e', check],
+    env: { PATH: process.env.PATH, COUNT: 2, BIG: 1n, GONE: undefined } }); // a BigInt could not cross the supervisor's channel
+  assert.deepEqual([result.status, result.exitCode], ['COMPLETED', 0]);
+});
+
+test('piped output is always read: a command writing more than a pipe holds finishes, and onOutput gets all of it', async () => {
+  // Before, nothing read the pipes: a command writing 1 MiB blocked until it was stopped (measured).
+  const writeMiB = ['-e', 'process.stdout.write("x".repeat(1024 * 1024)); process.stderr.write("done")'];
+  const chunks = { stdout: 0, stderr: 0 };
+  const result = await withTimeout(runSupervised({ command: process.execPath, args: writeMiB, stdio: ['ignore', 'pipe', 'pipe'],
+    onOutput: (chunk, stream) => { chunks[stream] += chunk.length; } }), 30_000, 'the command did not finish');
+  assert.deepEqual([result.status, result.outputComplete, chunks], ['COMPLETED', true, { stdout: 1024 * 1024, stderr: 4 }]);
+  const drained = await withTimeout(runSupervised({ command: process.execPath, args: writeMiB, stdio: ['ignore', 'pipe', 'pipe'] }),
+    30_000, 'the command did not finish without onOutput');
+  assert.deepEqual([drained.status, drained.outputComplete], ['COMPLETED', true]);
+  // A failing onOutput is not called again; the output is still drained and reported incomplete.
+  const failing = await runSupervised({ command: process.execPath, args: writeMiB, stdio: ['ignore', 'pipe', 'pipe'],
+    onOutput: () => { throw new Error('consumer failed'); } });
+  assert.deepEqual([failing.status, failing.outputComplete], ['COMPLETED', false]);
+  assert.equal('outputComplete' in await runSupervised({ command: process.execPath, args: ['-e', ''] }), false, 'nothing piped');
+  await assert.rejects(runSupervised({ command: process.execPath, onOutput: 'log' }), /onOutput/);
 });

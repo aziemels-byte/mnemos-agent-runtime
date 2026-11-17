@@ -7,20 +7,13 @@ import { hostname } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { FileCheckpointStore, FileIdempotencyRegistry, FilePhaseJobRegistry, GoalRecoveryCoordinator } from '../src/index.mjs';
-import { processIdentity } from '../src/directory-lock.mjs';
+import { processIdentity } from '../src/process-identity.mjs';
 import { FileJobStore } from '../src/job-store.mjs';
-import { deferred, temporaryDirectory, withTimeout } from './helpers.mjs';
+import { deferred, temporaryDirectory, until, withTimeout } from './helpers.mjs';
 
 const noExecute = async () => { throw new Error('must not run'); };
 const evidence = { authoritative: true, source: 'import-api:batch/9' };
 
-async function until(predicate, label, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-    await sleep(20);
-  }
-}
 
 /**
  * An import job: one effect per item, each keyed with effectKey() so that it
@@ -126,8 +119,9 @@ test('resume is refused unless the job is resumable, stopped, verified and inspe
   const directory = await temporaryDirectory(t);
   const store = new FileJobStore({ directory });
   const release = deferred();
+  const busyRuns = deferred(); // its dispatch is recorded before the executor runs: its sequence is stable then
   const jobs = new FilePhaseJobRegistry({ directory, execute: async ({ jobId, saveProgress }) => {
-    if (jobId === 'busy') { await release.promise; return { status: 'COMPLETED' }; }
+    if (jobId === 'busy') { busyRuns.resolve(); await release.promise; return { status: 'COMPLETED' }; }
     if (jobId !== 'plain') await saveProgress({ step: 1 });
     return jobId === 'done' ? { status: 'COMPLETED' } : { status: 'FAILED' };
   } });
@@ -135,6 +129,7 @@ test('resume is refused unless the job is resumable, stopped, verified and inspe
     await jobs.start({ jobId, objective: jobId, input: { n: 1 }, resumable });
   }
   for (const jobId of ['plain', 'done', 'failed']) await jobs.wait(jobId);
+  await busyRuns.promise;
   const other = new FilePhaseJobRegistry({ directory, execute: noExecute });
   const resume = async (jobId, extra = {}) => other.resume({ jobId, expectedSequence: (await store.read(jobId)).sequence,
     successorJobId: `${jobId}_2`, input: { n: 1 }, explicitAuthorization: true, ...extra });
@@ -174,8 +169,9 @@ test('a job whose recorded processes may still run cannot be resumed', { skip: p
   assert.deepEqual((await jobs.recover()).resumable, []);
 });
 
-test('a job settled over a live owner cannot be resumed while that owner may still run it', { skip: process.platform === 'win32' }, async t => {
-  const directory = await temporaryDirectory(t);
+// A resumable, dispatched job owned by a live process elsewhere, which an operator
+// settled (CANCELLED) with overrideRunningOwner: its owner may still run it.
+async function contestedJob(t, directory) {
   const owner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   t.after(() => owner.kill('SIGKILL'));
   await new Promise(resolve => owner.once('spawn', resolve));
@@ -188,6 +184,12 @@ test('a job settled over a live owner cannot be resumed while that owner may sti
   const settled = await jobs.reconcile({ jobId: 'contested', expectedSequence: record.sequence, disposition: 'CANCELLED', evidence,
     explicitAuthorization: true, overrideRunningOwner: true });
   assert.equal(settled.reconciliation.override.ownerState, 'ALIVE');
+  return { owner, jobs, settled };
+}
+
+test('a job settled over a live owner cannot be resumed while that owner may still run it', { skip: process.platform === 'win32' }, async t => {
+  const directory = await temporaryDirectory(t);
+  const { owner, jobs, settled } = await contestedJob(t, directory);
   await assert.rejects(jobs.resume({ jobId: 'contested', expectedSequence: settled.sequence, successorJobId: 'contested_2',
     explicitAuthorization: true }), error => error.code === 'JOB_STOP_UNVERIFIED' && error.ownerState === 'ALIVE');
   owner.kill('SIGKILL');
@@ -282,4 +284,16 @@ test('attempts form a chain: the root stays, effect keys stay, the inspector fol
   assert.deepEqual(keys, ['upload:upload', 'upload:upload', 'upload:upload']);
   assert.deepEqual(await jobs.jobInspector()({ id: 'upload' }), { status: 'COMPLETED', reason: null, effectAbsent: false,
     reconciliationRequired: false });
+});
+
+test('recover() lists as resumable only jobs that resume() accepts', { skip: process.platform === 'win32' }, async t => {
+  const directory = await temporaryDirectory(t);
+  const { owner, jobs, settled } = await contestedJob(t, directory);
+  await assert.rejects(jobs.resume({ jobId: 'contested', expectedSequence: settled.sequence, successorJobId: 'contested_2',
+    explicitAuthorization: true }), error => error.code === 'JOB_STOP_UNVERIFIED');
+  assert.deepEqual((await jobs.recover()).resumable, []);
+  // Once the owner is gone, both agree again.
+  owner.kill('SIGKILL');
+  await until(() => processIdentity(owner.pid) === null, 'the owner to exit');
+  assert.deepEqual((await jobs.recover()).resumable, ['contested']);
 });

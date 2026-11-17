@@ -12,10 +12,16 @@ Requires Node.js 22 or later. There are **no external runtime or development dep
 npm test
 npm run demo
 npm run check:publication
+npm run verify                # tests one file at a time, the publication gate, then verify:reliability
+npm run verify:reliability    # repeated runs under load (about 70 s on a 4-core Linux machine)
 node examples/lease-and-idempotency.mjs
 node examples/quality-gate.mjs
 node examples/cross-process.mjs
 ```
+
+`npm run verify` (or `node scripts/verify.mjs` from any directory) resolves every path from the repository itself, runs the test files one at a time, writes the full test log to `<tmp>/mnemos-test.log`, prints `TEST_EXIT`, `PUBLICATION_EXIT`, `RELIABILITY_EXIT` and `VERIFY_EXIT`, and fails when no test ran.
+
+`npm run verify:reliability` (`scripts/verify-reliability.mjs`, from any directory) repeats the checks that found real failures here, so that rare ones show up: the process-tree termination tests 30 times under CPU load and constant process start-up (Linux only, like those tests), and the full test suite run twice, two at a time. Each run must execute exactly the expected tests. The full output of every failing run is kept in `<tmp>/mnemos-reliability-<time>/`; the termination tests put the receipt and each surviving process's `/proc` details into their failure message. The load processes are supervised trees, so they never outlive the script.
 
 The demo creates a temporary workspace, rejects an empty candidate without starting regression, and validates an actual code change in a child Node.js process. It then starts a durable job whose command runs a small **process tree** (a command and its grandchild) under supervision, cancels it and verifies that the whole tree stopped, saves a checkpoint, and launches a **fresh Node.js process** that recovers the goal from the checkpoint and the job records and explicitly retries under a new job ID to complete a report. On Windows the tree's termination cannot be verified, so the recovered attempt is `UNKNOWN` and the demo reconciles it with evidence it checks itself before retrying. It cleans up its temporary files.
 
@@ -25,10 +31,11 @@ The demo creates a temporary workspace, rejects an empty candidate without start
 
 | Component | Responsibility | Important boundary |
 | --- | --- | --- |
-| `createCandidateVerifier` | Validate allowed paths and a non-empty candidate before regression | The workspace adapter must report every changed path; the verifier is not a filesystem sandbox |
+| `createCandidateVerifier` | Validate allowed paths and a non-empty candidate before regression; with `TestEvidence.regressionRunner()`, the regression run is a recorded check | The workspace adapter must report every changed path; the verifier is not a filesystem sandbox |
 | `PhaseJobRegistry` | Track job identity and execution phase; propagate abort; wait for an owned settlement | A cancellation request or timeout alone is not confirmed termination |
 | `FilePhaseJobRegistry` | The same job contract with identity and status recorded on disk, so they survive a restart and are shared by processes on one host; evidence-based reconciliation; explicit resumption from saved progress | Same-host file lock; a restart never replays a job; a job whose owner died becomes `UNKNOWN` (or `CANCELLED` if never dispatched) until reconciled |
-| `classifyProviderFailure` | Separate authentication, quota, model, timeout and transport failures; redact known credential patterns | It never retries, changes accounts or silently selects another model |
+| `classifyProviderFailure` | Separate authentication, quota, model, timeout and transport failures; say whether the request may have been processed (`requestOutcome`); redact known credential patterns | It never retries, changes accounts or silently selects another model; `retryable` is not "safe to retry" (see [Provider failures](#provider-failures)) |
+| `ProviderCaller`, `FileRateLimiter` | Call a provider with controlled retries (backoff, Retry-After, cancellation), rate limits and cooldowns shared by the processes of one host; uncertain outcomes are never repeated | Retries only what certainly had no effect, or what the caller declares idempotent; not a multi-host limiter |
 | `GoalRecoveryCoordinator` | Restore a checkpoint and reconcile each recorded job, with job status from `FilePhaseJobRegistry.jobInspector()` | Restoring state never automatically replays a task |
 | `spawnSupervised`, `runSupervised` | Run a command as a supervised process tree that never outlives its owner; stop it with a termination receipt that is confirmed only when the whole tree is verifiably gone | Linux covers descendants that leave the process group; other POSIX systems cover the group; Windows receipts are never confirmed |
 | `FileCheckpointStore` | Bound JSON size and atomically replace a checkpoint file; compare-and-swap on the last-read revision (on by default through `GoalRecoveryCoordinator`) | Writes are serialized across processes on one host; reads take no lock; not a multi-host store |
@@ -38,7 +45,8 @@ The demo creates a temporary workspace, rejects an empty candidate without start
 | `FileResourceLeaseManager` | Share the same exclusive leases between processes on one host through a state directory | Same-host, local-filesystem lock; not a multi-host or network-filesystem lock, nor permission to execute compute |
 | `FencingGuard` | Reject writes from a lease holder that has been superseded | Must run inside the resource owner and be checked in the same step as the write; in-memory |
 | `keepLeaseAlive` | Renew a held lease and abort a signal when it is lost | Advisory; never reacquires; a paused holder cannot observe the signal |
-| `QualityGate` | Fail-closed evaluation of candidate test receipts and regression metrics | Read-only decision; human review is mandatory and supplied evidence is not authenticated |
+| `TestEvidence` | Run checks (tests, scans) as recorded jobs; their records are the evidence | Trusts its state directory; a check without a test summary passes only when none was expected |
+| `QualityGate` | Fail-closed review of a candidate: every required check is resolved from its recorded evidence, for this candidate; plus regression metrics | Read-only decision; human review is mandatory; metrics and release qualification are still supplied by the caller |
 | `QualityFloorPolicy` | Propose routes meeting a minimum expected quality threshold | Does not execute providers or validate forecast calibration |
 
 ```mermaid
@@ -69,11 +77,11 @@ const result = await verify({
 });
 ```
 
-The snippet shows the interface. The [runnable example](examples/verify-candidate.mjs) supplies a real file adapter and executes a real regression check. A production adapter must include tracked changes, deletions, renames and untracked files in its inventory, using repository-relative forward-slash paths. A `passed` flag without a zero exit code does not verify a candidate.
+The snippet shows the interface. The [runnable example](examples/verify-candidate.mjs) supplies a real file adapter and runs the regression suite as a recorded check: `runRegression: evidence.regressionRunner({ command, args, cwd })` (see [Quality Gate](#quality-gate)); the verifier's result then carries its `evidenceId` and `subject` (`diff:sha256:<hash of the diff>`). A production adapter must include tracked changes, deletions, renames and untracked files in its inventory, using repository-relative forward-slash paths. A `passed` flag without a zero exit code does not verify a candidate.
 
 ## Additional safety examples
 
-Run `node examples/lease-and-idempotency.mjs` for a synthetic resource lease and a deduplicated operation. The idempotency adapter accepts `appendEvent(type, key, { record })` and `listEvents({ typePrefix })`; records may include results and must be kept in private storage. No store means process-local deduplication only. A journal shared by processes that run at the same time is not safe: each process decides from its own memory, so two of them can run the same key, and `restore()` marks another process's live execution as interrupted. Use `FileIdempotencyRegistry` for that (below). Request fingerprints are based on JSON serialization, so callers must use stable request shapes.
+Run `node examples/lease-and-idempotency.mjs` for a synthetic resource lease and a deduplicated operation. The idempotency adapter accepts `appendEvent(type, key, { record })` and `listEvents({ typePrefix })`; records may include results and must be kept in private storage. No store means process-local deduplication only. A journal shared by processes that run at the same time is not safe: each process decides from its own memory, so two of them can run the same key, and `restore()` marks another process's live execution as interrupted. Use `FileIdempotencyRegistry` for that (below). Request fingerprints are based on JSON serialization with object keys sorted, so key order does not matter (array order and values do). Records written by earlier versions, whose fingerprints depended on key order, still match a request sent with their original key order; another order is a conflict, never a new run.
 
 Within one registry instance, `restore()` rejects while execution, reconciliation or another restore is running. Until restoration finishes (including recovery journal writes), `execute()` and `reconcile()` reject. Reconciliation rejects for an executing key and reserves its key until its journal write settles; execution and other reconciliations for that key reject during that interval. These busy errors leave the existing state intact. Callers should await the active transition before explicitly retrying the rejected call. Executions for independent keys can still overlap, and matching concurrent executions share one effect.
 
@@ -81,12 +89,13 @@ The lease manager requires a `nodeRegistry.require(nodeId)` adapter whose nodes 
 
 For processes on the same host, use `FileResourceLeaseManager({ directory, nodeRegistry })`. It has the same methods and policy, but every method returns a promise and runs as a transaction: take the directory lock, load `leases.json`, apply the policy, atomically replace the state and unlock. Every process must use the same owner-controlled directory on a local filesystem that supports exclusive hard links.
 
-- A lock is removed by another process only when its holder ran on the same host and its PID no longer exists. A lock held by another host, a live or reused PID, or an unreadable record is never broken; callers instead get `LEASE_LOCK_TIMEOUT` after `lockTimeoutMs` (default 5 s). Processes that share a directory but not a PID namespace (for example separate containers) must not share a lease directory.
+- A lock is removed by another process only when its holder ran on the same host and is provably gone: its PID no longer exists or, on Linux, now belongs to a process that started at another time (lock records carry the holder's boot ID and start time). That includes this process's own PID, left by an earlier process that had it, such as PID 1 in a restarted container. A lock held by another host, a live PID, a reused PID it cannot verify (other platforms, locks written by earlier versions), or an unreadable record is never broken; callers instead get `LEASE_LOCK_TIMEOUT` after `lockTimeoutMs` (default 5 s). Processes that share a directory but not a PID namespace (for example separate containers) must not share a lease directory.
 - A process killed mid-transaction leaves its lock behind; the next caller removes it once that PID is gone. Temporary files left by a crashed writer are swept by the next transaction, and files belonging to processes that may still be running are kept.
 - If a process dies in the short window while it is clearing another process's stale lock, the lock stays until an operator clears it with `forceUnlock()` (see the runbook below). Calls fail with `LEASE_LOCK_TIMEOUT` until then. Staying stuck is deliberate: automatically clearing that state could grant one resource twice.
 - A crash is never a release: the lease stands until its TTL expires.
 - Unreadable or invalid lease state is rejected with `LEASE_STATE_INVALID` and is never treated as empty, because that would grant held resources again.
 - Expiry uses each process's clock, so the processes must share a host clock.
+- If a lock cannot be removed after an operation (for example a scanner holds the file on Windows), the operation's own result still stands and this process keeps removing the lock in the background. Until then it blocks other callers like any live holder's lock.
 - A process that is paused (not killed) while holding the directory lock blocks every lease operation, which fail with `LEASE_LOCK_TIMEOUT` until it resumes. Its lock is not broken because the process is still alive. The lock is held only for one short transaction.
 
 ### Fencing tokens
@@ -141,7 +150,7 @@ await coordinator.checkpoint({ goal, activeJobs });     // replaces only that re
 - While recovery is in progress, or after it overlapped another recovery or an explicit save, a default save fails with `CHECKPOINT_REVISION_REQUIRED`. Pass `expectedRevision` from the exact snapshot you used, or await a fresh recovery on its own to restore default saves. `lastKnownRevision` still shows the last observed or stored revision. It can differ from the revision of an earlier returned snapshot.
 - After `CHECKPOINT_CONFLICT` the coordinator keeps refusing until it calls `recover()` again, so a stale view is never adopted silently.
 - `expectedRevision` overrides the tracked revision. `unconditional: true` is the explicit opt-out (last writer wins), for example to replace an unreadable checkpoint after investigation.
-- At the store level, `store.save(value, { expectedRevision })` writes only if the stored checkpoint still has that revision; `null` means "only if none exists". `store.save(value)` without options is unconditional, as before.
+- At the store level, `store.save(value, { expectedRevision })` writes only if the stored checkpoint still has that revision; `null` means "only if none exists". `store.save(value)` without options is unconditional, as before. Every failure of `save()`, invalid arguments included, rejects its promise.
 - On `CHECKPOINT_CONFLICT`, nothing is written. Reload, reconcile and decide again; never retry blindly with the new revision.
 - `store.read()` returns `{ value, revision }`; `save()` resolves to `{ revision }`. `recover()` reports `checkpointRevision` for invalid checkpoints too, so they can be replaced conditionally.
 - Reads never take the lock: a stuck lock blocks saves (`CHECKPOINT_LOCK_TIMEOUT`) but never recovery reads.
@@ -155,18 +164,20 @@ await coordinator.checkpoint({ goal, activeJobs });     // replaces only that re
 ```js
 const effects = new FileIdempotencyRegistry({ directory: stateDirectory });
 const outcome = await effects.execute({ key: 'payment:42', request, operation: () => charge(request) });
+// failureProvesNoEffect: true, or error => true only for a failure that certainly had no effect (then FAILED, retryable
+// with retryFailed); otherwise a failure is UNKNOWN
 // IDEMPOTENCY_EXECUTED | IDEMPOTENT_REPLAY | IDEMPOTENCY_IN_PROGRESS | IDEMPOTENCY_UNKNOWN | IDEMPOTENCY_FAILED | IDEMPOTENCY_CONFLICT
 ```
 
 - Under the directory lock (`idempotency.lock`), `execute()` checks the key and records `STARTED` with its owner (PID, host, execution ID) before the effect runs. The effect runs without the lock; its outcome is recorded in a second short transaction.
 - While the owner is alive, other processes get `IDEMPOTENCY_IN_PROGRESS` (a new status; nothing runs) and `reconcile()` rejects. Retry later to get the replayed result. Within one registry instance, overlapping calls still share one execution.
-- Only a provably dead owner turns `STARTED` into `UNKNOWN` (reason `INTERRUPTED_AFTER_EFFECT_START`), so a live execution is never reported as interrupted. An owner on another host, or a dead owner whose PID now belongs to another running process, keeps the key `IN_PROGRESS`. That fails closed; see the operator override below.
-- If an outcome cannot be recorded (for example a result that is not JSON, or a disk error), the key becomes `UNKNOWN`. If even that write fails (for example the lock is blocked), it is retried in the background with backoff (25 ms up to 2 s) while the process runs, so other processes do not see the key `IN_PROGRESS` for the rest of the owner's lifetime. The retry never replaces a record someone else has resolved, and never keeps a finished process alive. Unreadable or mismatched records fail with `IDEMPOTENCY_STATE_INVALID` and are never treated as absent, because that would run the effect again.
+- Only a provably dead owner turns `STARTED` into `UNKNOWN` (reason `INTERRUPTED_AFTER_EFFECT_START`), so a live execution is never reported as interrupted. An owner on another host keeps the key `IN_PROGRESS`, and so does a dead owner whose PID now belongs to another running process unless its record carries a start time to tell them apart (Linux, records written by this version). That fails closed; see the operator override below.
+- If the outcome cannot be recorded at once (for example the lock is blocked, or a disk error), the key stays `STARTED` and this process keeps writing the outcome it knows in the background with backoff (25 ms up to 2 s) while it runs, so other processes do not see the key `IN_PROGRESS` for the rest of the owner's lifetime. A result that can never be recorded (not JSON, or too large) makes the key `UNKNOWN` instead. Meanwhile this process's own `execute()` reports `IDEMPOTENCY_UNKNOWN`. The background write never replaces a record someone else has resolved (for example a later call in this thread that already found the key `UNKNOWN`), and never keeps a finished process alive. Unreadable or mismatched records fail with `IDEMPOTENCY_STATE_INVALID` and are never treated as absent, because that would run the effect again.
 - `inspect(key)` returns a record with its owner's state; `snapshot()` counts records by state. Records keep results on disk: use a private, owner-controlled directory.
 
 ### Operator runbook: a key stuck IN_PROGRESS
 
-If a key stays `IDEMPOTENCY_IN_PROGRESS` although its owner is known to be gone (its PID was reused by another process, or it ran on another host), establish the effect's real outcome from an authoritative source, then:
+If a key stays `IDEMPOTENCY_IN_PROGRESS` although its owner is known to be gone (its PID was reused by another process and its record has no start time to show it, or it ran on another host), establish the effect's real outcome from an authoritative source, then:
 
 ```js
 const record = await effects.inspect(key);   // owner: { pid, host, executionId }, ownerState
@@ -193,11 +204,11 @@ const receipt = await tree.terminate({ graceMs: 5_000, killWaitMs: 5_000 });
 const jobs = new PhaseJobRegistry({ execute: ({ signal }) => runSupervised({ command: 'make', args: ['test'], signal }) });
 ```
 
-- `terminate()` freezes the tree (SIGSTOP, rescanning until no new process appears), sends SIGTERM (and SIGCONT, so handlers run), waits `graceMs`, freezes again and sends SIGKILL. While waiting it rescans, so a process started by a SIGTERM handler is stopped too. `confirmed` is true only when the group is empty, every process found is gone and a fresh scan finds nothing running; exited processes awaiting reaping count as gone.
+- `terminate()` freezes the tree (SIGSTOP, rescanning until no new process appears), sends SIGTERM (and SIGCONT, so handlers run), waits `graceMs`, freezes again and sends SIGKILL. While waiting it rescans, so a process started by a SIGTERM handler is stopped too. `confirmed` is true only when the group is empty, every process found is gone and a fresh scan, made after the last signal, finds nothing running; exited processes awaiting reaping count as gone.
 - The tree never outlives its owner: the supervisor runs in its own session, connected to the owner by an IPC channel. When the owner exits, crashes or is killed (even with SIGKILL, or its whole process group), the supervisor stops the tree. Members left in the group after the command ended are stopped when the owner exits.
 - On Linux the supervisor also follows parent links in `/proc` every `trackIntervalMs` (default 250 ms), and every command carries an environment marker (`MNEMOS_TREE_<id>=1`, in `receipt.marker` and `tree.marker`) that its descendants inherit. Descendants that start their own session or group are found and stopped either way (`coverage: 'process-group+descendants'`). Process IDs are checked against their start time before any signal, so a reused PID is never signalled.
-- `beforeStart({ supervisor, marker })` runs before the command starts (if it throws, or the owner dies first, the command never starts); `onStart({ pid, identity, marker })` runs once it runs. `runSupervised` reports `COMPLETED` or `FAILED` by exit code when the command ends by itself (and stops what it left in its group), `CANCELLED` with the receipt on abort, and `effectAbsent: true` when the command never started.
-- Limits: on Linux, a process that clears its environment, leaves the group and loses its parent before any scan sees it cannot be found. Other POSIX systems cover the process group only. Windows has no process groups: the tree is stopped with `taskkill /T`, which cannot reach descendants whose parent already exited, so receipts are never confirmed there. Only processes of the same user can be inspected. Each supervisor is a Node.js process (about 100 ms to start). Piped `stdout`/`stderr` streams keep the owner alive until they are consumed or closed, as with any child process.
+- `beforeStart({ supervisor, marker })` runs before the command starts (if it throws, or the owner dies first, the command never starts); `onStart({ pid, identity, marker })` runs once it runs. `runSupervised` reports `COMPLETED` or `FAILED` by exit code when the command ends by itself (and stops what it left in its group), `CANCELLED` with the receipt on abort, and `effectAbsent: true` when the command never started. If the go-ahead was sent but the start was never reported (the supervisor died or timed out), it reports `UNKNOWN` with `startUnconfirmed: true`, never effect-free: on Linux it first stops the supervisor and everything carrying the tree's marker, with a receipt in `termination`. A supervisor that cannot be spawned at all (for example `EMFILE`) is a start failure (`FAILED`, `effectAbsent: true`), never a crash of the owner.
+- Limits: on Linux, a process that clears its environment, leaves the group and loses its parent before any scan sees it cannot be found. That includes a process started during the grace period: the tree runs again then, so that SIGTERM handlers can finish (measured: a Node process sent SIGTERM and SIGCONT may still start children before it exits), and the next scan comes within about 100 ms. Other POSIX systems cover the process group only. Windows has no process groups: the tree is stopped with `taskkill /T`, which cannot reach descendants whose parent already exited, so receipts are never confirmed there. Only processes of the same user can be inspected. Each supervisor is a Node.js process (about 100 ms to start). Piped `stdout`/`stderr` streams keep the owner alive until they are consumed or closed, as with any child process. `runSupervised` (and a job's `runProcess`) always reads piped output, so a command writing more than a pipe holds is never blocked: each chunk goes to `onOutput(chunk, 'stdout' | 'stderr')` if given, and `outputComplete` says whether all of it arrived (the pipes closed within 2 s of the end).
 
 ### Job status across restarts
 
@@ -214,7 +225,7 @@ await new FilePhaseJobRegistry({ directory: stateDirectory, execute }).get('repo
 - Records are written ahead of the work: `start()` records the job (`RUNNING`, phase `queued`) before it resolves; `dispatched: true` is recorded before the executor is called; the outcome is recorded after the executor settles. If the dispatch cannot be recorded, the executor is not called and the job is `FAILED` with `effectAbsent: true` (`DISPATCH_NOT_RECORDED`).
 - A job ID runs at most once, across processes and restarts. Starting an existing ID returns its recorded state; a different objective or input is refused with `JOB_IDENTITY_CONFLICT`. A retry is a new job ID.
 - Phase changes are recorded in the background, in order and coalesced, so `setPhase()` never blocks the executor; after a crash the recorded phase may lag behind. A cancellation request is recorded in order before the outcome, without delaying the abort.
-- Outcomes follow `PhaseJobRegistry`. Each carries a `reason`. `effectAbsent: true` (a retry is safe) is recorded only when the executor explicitly returns it with `FAILED` or a confirmed `CANCELLED`, or when the executor was never called. A thrown error never proves that nothing happened and is never recorded.
+- Outcomes follow `PhaseJobRegistry`. Each carries a `reason`. An executor that cannot tell whether its effect happened returns `{ status: 'UNKNOWN' }`; the job is then `UNKNOWN` (`EXECUTOR_REPORTED_UNKNOWN`) and needs reconciliation. `effectAbsent: true` (a retry is safe) is recorded only when the executor explicitly returns it with `FAILED` or a confirmed `CANCELLED`, or when the executor was never called. A thrown error never proves that nothing happened and is never recorded.
 - If an outcome cannot be recorded, this process reports the job `UNKNOWN` (`OUTCOME_NOT_RECORDED`) and keeps retrying in the background. After a restart, the record is what counts.
 - Results are recorded only as plain JSON of at most 64 KiB; anything else is dropped (`resultDiscarded: true`) without changing the status. Inputs are not recorded, only their fingerprint.
 - Unreadable or inconsistent records fail with `JOB_STATE_INVALID` and are never treated as absent or overwritten. `list()` returns every job and the files it could not read.
@@ -239,10 +250,26 @@ const { jobs, invalid, reclassified, unrecorded, unverified, orphaned, resumable
 | `RUNNING`, dispatched | provably gone | `UNKNOWN`, `reconciliationRequired: true`, reason `OWNER_DIED_AFTER_DISPATCH` |
 | `RUNNING` | on another host, or unreadable (`OTHER_HOST`, `UNREADABLE`) | `RUNNING`; listed in `unverified` for an operator to reconcile |
 
-- An owner is provably gone when it ran on this host and its PID no longer exists, or when the record names this process's PID with an execution this process is not running (an earlier process had the same PID). Registry instances in one process see each other's jobs as alive.
+- An owner is provably gone when it ran on this host and its PID no longer exists, or when the record names this process's PID with an execution that is not running: recorded with another start time (an earlier process had the same PID), or by this thread, which is no longer running it. Registry instances in one thread see each other's jobs as alive, and so do worker threads of one process: a job recorded by another thread counts as alive while this process runs, including when that thread ended while running it (settle such a job with `overrideRunningOwner: true`).
 - `get()`, `list()`, `start()`, `wait()` and `requestCancellation()` apply the same rules whenever they meet such a job, so `recover()` is a summary, not a precondition. The reclassification is recorded by compare-and-swap under the lock: every process agrees, it happens once, and a later reuse of the PID cannot make the job look alive again. If it cannot be recorded yet (for example `JOB_LOCK_TIMEOUT`), the job is reported `UNKNOWN` with reason `OWNER_DIED_NOT_RECORDED`, listed in `unrecorded`, and the next read tries again.
 - `wait(jobId, { timeoutMs })` also follows jobs owned by other instances or processes, polling their record every `pollIntervalMs` (default 50 ms) until they are no longer `RUNNING`, including when their owner dies. Without `timeoutMs` it waits indefinitely, also for an owner on another host; with it, it resolves to the current state, which may still be `RUNNING`.
 - On Linux, each job records its owner's boot ID and process start time. An owner is then also provably gone when the host has rebooted since, or when its PID now belongs to a process that started at another time (PID reuse). Elsewhere, and for records written without this identity, an unrelated process that reuses a dead owner's PID before the job is reclassified makes the owner look alive; the job then stays `RUNNING` until an operator reconciles it with `overrideRunningOwner: true`. Processes must share a PID namespace (see [Coordination guarantees](#coordination-guarantees)).
+
+#### Job history
+
+Every write of a job's record also appends one event to that job's history (`<hash>.history.jsonl` next to its record), under the same lock and after the record is written. The record stays the source of truth: an event never describes a change that was not stored.
+
+```js
+const { events, complete, missing } = await jobs.history('import');
+// events: [{ jobId, rootJobId, sequence, at, type, changed, status, phase, reason, ... }], oldest first
+const failures = await jobs.searchHistory({ type: 'STATUS_CHANGED', status: 'FAILED', since: '2026-01-01T00:00:00Z' });
+const attempts = await jobs.searchHistory({ rootJobId: 'import' });   // every attempt of a resumed job
+```
+
+- Types: `CREATED`, `DISPATCHED`, `PHASE_CHANGED`, `PROGRESS_SAVED`, `PROCESS_RECORDED`, `CANCELLATION_REQUESTED`, `STATUS_CHANGED` (with `previousStatus` and `reason`), `RECONCILED` (with `disposition` and `evidenceSource`), `ORPHANS_TERMINATED`, `RESUMED` (with `resumedBy`), `UPDATED`. `changed` lists every field a write changed. Results, saved progress and evidence contents stay in the record.
+- Each event carries the record's `sequence`, which grows by one per write. An event that could not be appended (a disk error, a history at its 1 MiB limit) never fails the write; it shows as a gap: `complete` is false and `missing` lists the ranges of sequences without an event. A line cut off by a crash counts in `unreadableLines`; the next event still starts on its own line.
+- `searchHistory({ jobId, rootJobId, type, status, reason, since, until, limit })` matches every given filter across all jobs, oldest first; over `limit` (default 1000, at most 10000) it keeps the most recent and sets `truncated`. It reads every history file: a scan, not an index.
+- State held only in the running process (a phase not yet recorded) appears once it is recorded. Recording an event adds about 0.3 ms to a record write (measured on Linux).
 
 #### Orphaned processes
 
@@ -343,7 +370,7 @@ const state = await leases.inspectLock();   // or checkpointStore.inspectLock()
 
 | `holderState` | Meaning | Action |
 | --- | --- | --- |
-| `ALIVE` | The holder is running on this host, possibly paused | Wait, or stop that process. `forceUnlock` refuses. |
+| `ALIVE` | The holder is running on this host, possibly paused (on Linux verified by its start time) | Wait, or stop that process. `forceUnlock` refuses. |
 | `DEAD` | The holder exited | Normally cleared automatically. If a `pendingBreaks` entry is `DEAD` too, a breaker died mid-recovery: use `forceUnlock`. |
 | `OTHER_HOST` | Written from another host; cannot be checked | Confirm that process is gone, then use `forceUnlock`. Hosts must not share a lease directory. |
 | `UNREADABLE` | The lock record is damaged | Confirm no lease operation is running, then use `forceUnlock`. |
@@ -359,27 +386,74 @@ await leases.forceUnlock({ expectedLockId: state.lockId, explicitAuthorization: 
 
 ## Quality Gate
 
-MNEMOS includes a standalone, **read-only** quality gate for agent-generated change candidates. The public extraction combines concepts from five private modules; it does not expose the production orchestration code.
+MNEMOS includes a **read-only** quality gate for agent-generated change candidates. It takes no check result from its caller: the runtime runs each check, and the gate reads the result from the check's record.
 
 ```js
-import { QualityGate } from './src/index.mjs';
+import { QualityGate, TestEvidence, REQUIRED_EVALUATIONS } from './src/index.mjs';
 
-const decision = new QualityGate().review({
-  definition: {
-    executionPolicy: { requiresIsolatedWorktree: true },
-    approvalPolicy: { autoMerge: false }
-  },
-  checks: { unit: unitReceipt, integration: integrationReceipt,
-    regression: regressionReceipt, benchmark: benchmarkReceipt,
-    security: securityReceipt, recovery: recoveryReceipt },
+const evidence = new TestEvidence({ directory: stateDirectory });
+const subject = `diff:sha256:${diffHash}`;                     // what is checked: this candidate
+const receipts = await Promise.all(REQUIRED_EVALUATIONS.map(category =>
+  evidence.run({ category, subject, command: 'node', args: ['--test'], cwd: worktree })));
+
+const decision = await new QualityGate({ evidence }).review({
+  definition: { executionPolicy: { requiresIsolatedWorktree: true }, approvalPolicy: { autoMerge: false } },
+  subject,
+  checks: Object.fromEntries(receipts.map(receipt => [receipt.category, receipt.evidenceId])),
   baseline: baselineMetrics,
   candidate: candidateMetrics
 });
+// decision.evaluations.evidence.<category>: { evidenceId, verified, reason, passed }
 ```
 
-Each required receipt must contain `passed: true`, `completed: true`, `exitCode: 0` and a non-empty `evidenceId`. Metrics require equal positive sample counts, finite success rate, quality, cost and latency, and nonnegative regression counts. Only non-regressing candidates with all required receipts return `READY_FOR_HUMAN_REVIEW`. The optional release qualification checks eight additional categories with traceable evidence. `QualityFloorPolicy` proposes candidate routes above a configured quality threshold without executing any provider.
+- **A check is a job.** `evidence.run()` records a `FilePhaseJobRegistry` job whose executor runs the command as a [supervised process tree](#supervised-process-trees): recorded before it starts, stopped (with a termination receipt) when it exceeds `timeoutMs` (default 10 minutes) or its `signal` aborts, listed in the [job history](#job-history), and kept across restarts. The evidence ID is the job ID; it runs at most once, and asking again reports the recorded check.
+- **The record is the evidence:** command, arguments, working directory, exit code and signal, start and end, the SHA-256 and size of all output, the last 4 KiB of output (from a line start, with known credential patterns redacted), and the `node --test` summary when the output ends with one. The environment is passed to the command but never recorded.
+- **Passed** means: the command exited 0, all its output arrived, and its test summary shows at least one test and no failure. Without a summary a check passes only if it was started with `expectTestSummary: false` (for a command that is not a test runner). Measured: `node --test` exits 0 when no file matches, and also when it runs under another test process's `NODE_TEST_CONTEXT` (it then skips every file); that variable is never passed to a check.
+- **The gate verifies, it does not accept.** For each required category (`unit`, `integration`, `regression`, `benchmark`, `security`, `recovery`) it resolves the evidence ID from the job records and refuses evidence that does not exist, is not a check, belongs to another category or another `subject`, or has not finished (`EVIDENCE_NOT_FOUND`, `EVIDENCE_NOT_A_CHECK`, `EVIDENCE_CATEGORY_MISMATCH`, `EVIDENCE_SUBJECT_MISMATCH`, `EVIDENCE_NOT_SETTLED`). `subject` binds evidence to one candidate, so a passing run cannot be reused for another.
+- Metrics require equal positive sample counts, finite success rate, quality, cost and latency, and nonnegative regression counts. Only non-regressing candidates whose every required check passed return `READY_FOR_HUMAN_REVIEW`. The optional release qualification checks eight additional categories with traceable evidence. `QualityFloorPolicy` proposes candidate routes above a configured quality threshold without executing any provider.
+- `createCandidateVerifier({ runRegression: evidence.regressionRunner({ command, args, cwd }) })` runs a candidate's regression suite as a `regression` check for the subject `diff:sha256:<hash of the diff>`.
 
-Run the synthetic example with `node examples/quality-gate.mjs`. The package does **not** run tests, authenticate external receipts, attest that a real worktree was isolated, establish benchmark equivalence, merge code or deploy changes. A trusted caller must supply real results and independently enforce policy; passing this gate is not a production safety certification.
+Run the example with `node examples/quality-gate.mjs`: it actually runs six checks. The gate trusts its state directory: anyone who can write job records there can forge evidence, so keep it owner-controlled. Metrics and release qualification are still supplied by the caller. The package does not attest that a real worktree was isolated, establish benchmark equivalence, merge code or deploy changes; passing this gate is not a production safety certification.
+
+## Provider failures
+
+`classifyProviderFailure(error)` names the failure (`kind`, `scope`), parses `Retry-After`, and redacts the message. It never retries. Two fields answer different questions:
+
+- `retryable`: could trying again succeed (a timeout, a dropped connection)? It does **not** say the retry is safe.
+- `requestOutcome`: could the failed request have had its effect?
+  - `NOT_SENT`: it never reached the provider (connection refused, DNS failure, a local process that never started).
+  - `REJECTED`: the provider answered with an HTTP 4xx (other than 408): refused before processing.
+  - `AMBIGUOUS`: anything else, including timeouts, reset connections and 5xx. A message alone never proves a refusal: a CLI can report a usage limit after it already acted.
+
+Retry automatically only `NOT_SENT` or `REJECTED` requests whose cause has changed. Retry an `AMBIGUOUS` request only if it is idempotent, or through an idempotency key (`FileIdempotencyRegistry`, with `effectKey()` inside a job), so that a completed effect is replayed instead of repeated. [`ProviderCaller`](#provider-calls) applies these rules.
+
+## Provider calls
+
+`ProviderCaller` calls a provider with controlled retries, built on `classifyProviderFailure`, the idempotency registries and, optionally, `FileRateLimiter`:
+
+```js
+import { FileIdempotencyRegistry, FileRateLimiter, ProviderCaller } from './src/index.mjs';
+
+const limiter = new FileRateLimiter({ directory: stateDirectory, limits: { openai: { requests: 60, perMs: 60_000 } } });
+const calls = new ProviderCaller({ limiter, effects: new FileIdempotencyRegistry({ directory: stateDirectory }),
+  maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 30_000 });
+
+const outcome = await calls.call({ provider: 'openai', key: effectKey('summary'), request, signal,
+  operation: async ({ signal }) => {
+    const response = await fetch(url, { method: 'POST', body, signal });
+    if (!response.ok) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status, headers: response.headers });
+    return response.json();
+  } });
+// outcome.status: SUCCEEDED | FAILED | UNCERTAIN | CANCELLED | IN_PROGRESS | CONFLICT; outcome.attempts: one entry per attempt
+```
+
+- **What is retried.** A failed attempt is retried only if repeating it is safe and may succeed. Safe: it certainly had no effect (`requestOutcome` `NOT_SENT` or `REJECTED`), or the caller passes `idempotent: true` because the provider deduplicates the request. May succeed: the failure is `retryable`, or the provider sent `Retry-After`. An `AMBIGUOUS` failure of a call that is not idempotent is never repeated: the call is `UNCERTAIN`.
+- **How Node's fetch failures classify** (measured against a local server): a refused connection or a DNS failure is `NOT_SENT` and retryable; a timeout, a dropped connection (`UND_ERR_SOCKET`) or a 503 is `AMBIGUOUS` and retryable; a 429 with `Retry-After` is `REJECTED` with `retryAfterMs`; a 401 is `REJECTED` and not retried.
+- **When.** Exponential backoff with full jitter (`baseDelayMs` doubling, at most `maxDelayMs`), never shorter than `Retry-After`. `Retry-After` also becomes a cooldown in the limiter, so no process on the host calls that provider before it ends. A delay or a limiter wait longer than `maxDelayMs` ends the call (`FAILED`, with `reason` and `retryAfterMs`) instead. `maxAttempts` bounds the attempts.
+- **Cancellation.** `signal` stops a backoff or limiter wait at once, and no further attempt starts (`CANCELLED`). It is also passed to the operation: a request aborted in flight may have had its effect, so it is `UNCERTAIN` unless it certainly had none.
+- **Uncertain outcomes.** `FAILED` and `CANCELLED` carry `effectAbsent`: true only if no attempt can have had an effect. With a `key`, the whole call is one keyed effect in the idempotency registry: a completed call is replayed (`replayed: true`) instead of run again, one running elsewhere is `IN_PROGRESS`, an `UNCERTAIN` one stays `UNKNOWN` and is never run again until reconciled (`effects.reconcile()`, see above), and one that failed without any effect may be run again with `retryFailed: true`. Inside a job, use `effectKey(name)` as the key: a resumed attempt then never repeats an uncertain call, and an executor reports an `UNCERTAIN` call as `{ status: 'UNKNOWN' }`.
+- **Rate limits.** `FileRateLimiter({ directory, limits })` allows at most `requests` calls per `perMs` for each provider (a token bucket), shared by every process that uses the directory (`rate-limits.json` under `rate-limits.lock`, with the same lock and runbook as the other state). `acquire(provider, { signal, maxWaitMs })` waits for a slot; `cooldown(provider, ms)` blocks a provider for everyone. Processes must share the host clock.
+- A failed attempt's error is not kept: `attempts` and `failure` carry its classification, with the message redacted.
 
 ## Coordination guarantees
 
@@ -391,6 +465,7 @@ What holds where. "One host" means processes on the same machine that share an o
 | A write with an older token is rejected after the resource accepts a newer token | `FencingGuard` at the resource | `FencingGuard` in the process that owns the resource; tokens come from the shared counter | Not provided |
 | Holder learns it lost a lease | `keepLeaseAlive` signal (advisory; a paused process cannot see it) | Same | Not provided |
 | A resumed job repeats no keyed effect | Not provided by `PhaseJobRegistry` | `resume()` with `effectKey()` and `FileIdempotencyRegistry` (completed effects replay; interrupted ones are `UNKNOWN`) | Not provided |
+| Provider calls rate-limited; a provider's Retry-After respected by every caller | Not provided without a limiter | `FileRateLimiter` (directory lock) | Not provided |
 | Effect started at most once per key; ambiguous outcome never re-run | `IdempotencyRegistry` (overlapping calls share one run) | `FileIdempotencyRegistry` (others get `IN_PROGRESS`, then `REPLAY`) | Not provided |
 | External effect exactly once | Not provided: an interrupted effect is `UNKNOWN` until authoritative reconciliation | Same | Not provided |
 | Checkpoint never torn | `FileCheckpointStore` (atomic replace) | Same | Not provided |
@@ -403,7 +478,7 @@ What holds where. "One host" means processes on the same machine that share an o
 
 Limits that apply to every row:
 
-- A process counts as gone when it ran on this host and its PID no longer exists. On Linux, a process that has exited but was not yet reaped by its parent (a zombie) also counts as gone, so a slow or non-reaping init (for example a container without `--init`) cannot keep a dead holder's lock or job alive.
+- A process counts as gone when it ran on this host and its PID no longer exists. On Linux, lock and job records also carry the process's boot ID and start time, so a PID reused by another process (including a restarted container's PID 1) does not keep a dead holder or owner alive. Job and effect owners also record their thread, so worker threads of one process never take each other's running work for dead. On Linux, a process that has exited but was not yet reaped by its parent (a zombie) also counts as gone, so a slow or non-reaping init (for example a container without `--init`) cannot keep a dead holder's lock or job alive.
 - A lock is never broken while its holder may be alive. A paused holder blocks that directory until it resumes; calls fail with a `*_LOCK_TIMEOUT` error that names the holder and the next step.
 - Processes must share a host clock, a PID namespace and a local filesystem with atomic exclusive hard links. Separate containers or network filesystems must not share a state directory.
 - Deleting or resetting state files (`leases.json`, idempotency and job records, checkpoints) while any process could still act voids these guarantees.
@@ -418,7 +493,7 @@ Limits that apply to every row:
 - Checkpoints are versioned and bounded to 1 MiB. Malformed state and failed job inspection require reconciliation. Stored state is not an instruction to execute work.
 - Each `jobInspector(job, { signal })` call is limited to `inspectionTimeoutMs` (default 10 s), and all inspections in one `recover()` to `recoveryTimeoutMs` (default 120 s). A job whose inspection fails, times out or returns an unsupported status, or that is not reached within the budget, is `UNKNOWN`, and `recoveryReason` says why (`INSPECTION_FAILED`, `INSPECTION_TIMEOUT`, `INSPECTION_UNSUPPORTED_STATUS`, `RECOVERY_TIMEOUT`). On timeout the signal aborts; an inspector that ignores it is abandoned, not awaited.
 - State files (checkpoints, leases, idempotency and job records) use same-directory replacement of a flushed temporary file, then flush the directory so the replacement survives a power loss; a new state directory is also flushed into its parent. Windows cannot flush a directory, so there this relies on NTFS metadata journaling and is best effort. Saves are serialized across processes on one host by a directory lock. This is not a claim of multi-host durability, of durability on filesystems or disks that ignore flush requests, or of protection against an attacker controlling the state directory. Use an owner-controlled directory. Unix permission bits do not replace Windows ACLs.
-- Diagnostic redaction recognizes selected credential patterns. It is best-effort and does not make arbitrary logs or personal data safe to publish.
+- Diagnostic redaction recognizes selected credential patterns: keys and tokens, credential assignments (`password=`, `token=`, `*_SECRET_ACCESS_KEY=` ...), the whole value of `Authorization` and cookie headers, URL credentials and private keys (also when cut off). It runs in linear time (about 50 ms per MB); `classifyProviderFailure` redacts before truncating to 2400 characters. It is best-effort and does not make arbitrary logs or personal data safe to publish.
 - Coordination across processes is summarized in [Coordination guarantees](#coordination-guarantees). A successful remote resource lease does not permit remote execution by itself.
 - No model quality, token savings, benchmark score or commercial production scale is claimed by this sample.
 

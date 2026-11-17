@@ -6,7 +6,9 @@ import { readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { FencingGuard, FileResourceLeaseManager } from '../src/index.mjs';
-import { temporaryDirectory } from './helpers.mjs';
+import { DirectoryLock } from '../src/directory-lock.mjs';
+import { processIdentity } from '../src/process-identity.mjs';
+import { failFsPromises, temporaryDirectory, until, workerThread } from './helpers.mjs';
 
 const nodeRegistry = () => ({ require: () => ({ trust: 'VERIFIED', status: 'AVAILABLE' }) });
 const fileManager = (directory, options = {}) => new FileResourceLeaseManager({ directory, nodeRegistry: nodeRegistry(), ...options });
@@ -269,13 +271,6 @@ test('racing processes receive unique, gap-free fencing tokens', async t => {
   assert.equal((await fileManager(directory).snapshot()).lastFencingToken, 8);
 });
 
-async function until(predicate, label, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-}
 
 test('a paused holder whose lease expired is fenced out by the protected resource',
   { skip: process.platform === 'win32' && 'SIGSTOP/SIGCONT are POSIX-only' }, async t => {
@@ -504,4 +499,79 @@ test('a lease keeper in one process holds the resource against other processes u
   const next = await attempt();
   assert.equal(next.status, 'LEASE_ACQUIRED');
   assert.equal(next.lease.fencingToken, 2);
+});
+
+// Guard for the B3 fix: a lock this process holds right now stays alive.
+test('a lock held by this process right now is reported alive and is never broken', async t => {
+  const directory = await temporaryDirectory(t);
+  const holder = new DirectoryLock({ directory, name: 'leases.lock', timeoutMs: 5_000 });
+  const manager = fileManager(directory, { lockTimeoutMs: 200 });
+  await holder.run(async () => {
+    const view = await manager.inspectLock();
+    assert.equal(view.holderState, 'ALIVE');
+    await assert.rejects(manager.list(), error => error.code === 'LEASE_LOCK_TIMEOUT');
+    await assert.rejects(manager.forceUnlock({ expectedLockId: view.lockId, explicitAuthorization: true }),
+      error => error.code === 'LOCK_HOLDER_ALIVE');
+  });
+  assert.deepEqual(await manager.list(), []);
+});
+
+// A holder is identified by PID, boot ID and start time (Linux), so a PID that
+// now belongs to another process (B3) no longer keeps a dead holder's lock.
+const linux = process.platform === 'linux';
+const staleRecord = (pid, identity, startTicks) => JSON.stringify({ token: randomUUID(), pid, host: hostname(),
+  lockedAt: new Date(Date.now() - 60_000).toISOString(), bootId: identity.bootId, startTicks });
+
+test('a lock left by an earlier process that had this PID is recovered', { skip: !linux }, async t => {
+  const directory = await temporaryDirectory(t);
+  // An earlier run with the same PID (PID 1 in a restarted container that kept
+  // its volume and hostname) crashed while holding the lock.
+  const own = processIdentity(process.pid);
+  await writeFile(path.join(directory, 'leases.lock'), staleRecord(process.pid, own, String(BigInt(own.startTicks) - 1n)));
+  const manager = fileManager(directory, { lockTimeoutMs: 500 });
+  assert.equal((await manager.inspectLock()).holderState, 'DEAD');
+  assert.deepEqual(await manager.list(), []);
+});
+
+test('a dead holder whose PID now belongs to another running process is recognized', { skip: !linux }, async t => {
+  const directory = await temporaryDirectory(t);
+  const other = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  t.after(() => other.kill('SIGKILL'));
+  await new Promise(resolve => other.once('spawn', resolve));
+  const identity = processIdentity(other.pid);
+  const lockFile = path.join(directory, 'leases.lock');
+  const manager = fileManager(directory, { lockTimeoutMs: 300 });
+  // Guard: the same process (same start time) is alive and its lock is never broken.
+  await writeFile(lockFile, staleRecord(other.pid, identity, identity.startTicks));
+  assert.equal((await manager.inspectLock()).holderState, 'ALIVE');
+  await assert.rejects(manager.list(), error => error.code === 'LEASE_LOCK_TIMEOUT');
+  // Another start time: the holder died and its PID was reused.
+  await writeFile(lockFile, staleRecord(other.pid, identity, String(BigInt(identity.startTicks) - 1n)));
+  assert.equal((await manager.inspectLock()).holderState, 'DEAD');
+  assert.deepEqual(await manager.list(), []);
+});
+
+test('a lock held by another thread of this process is alive and is never broken', async t => {
+  const directory = await temporaryDirectory(t);
+  const worker = workerThread(t, `
+    const { DirectoryLock } = await import(workerData.lockUrl);
+    const lock = new DirectoryLock({ directory: workerData.directory, name: 'leases.lock' });
+    await lock.run(() => new Promise(resolve => { parentPort.postMessage('held'); parentPort.once('message', resolve); }));
+    parentPort.postMessage('released');`, { directory, lockUrl: new URL('../src/directory-lock.mjs', import.meta.url).href });
+  assert.equal(await worker.next(), 'held');
+  const manager = fileManager(directory, { lockTimeoutMs: 300 });
+  assert.equal((await manager.inspectLock()).holderState, 'ALIVE');
+  await assert.rejects(manager.list(), error => error.code === 'LEASE_LOCK_TIMEOUT');
+  const released = worker.next();
+  worker.send('release');
+  assert.equal(await released, 'released');
+  assert.deepEqual(await manager.list(), []);
+});
+
+test('a lock that could not be removed neither fails the committed operation nor blocks the next one', async t => {
+  const directory = await temporaryDirectory(t);
+  const lock = new DirectoryLock({ directory, name: 'leases.lock', timeoutMs: 500 });
+  failFsPromises(t, 'rm', target => target === lock.lockFile);
+  assert.equal(await lock.run(async () => 'committed'), 'committed');
+  assert.equal(await lock.run(async () => 'next'), 'next');
 });

@@ -2,9 +2,10 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { processIdentity } from './directory-lock.mjs';
+import { processIdentity } from './process-identity.mjs';
 
-// Internal module: supervised process trees. Not exported from index.mjs yet.
+// Supervised process trees. spawnSupervised and runSupervised are exported from
+// index.mjs; the scanning and stopping helpers are internal.
 
 const MAX_WAIT_MS = 60_000;
 const posix = process.platform !== 'win32';
@@ -203,7 +204,9 @@ export async function stopTree(pgid, marker, roots, graceMs, killWaitMs) {
             signalTree(pgid, added, signal);
             if (signal === 'SIGTERM' && frozen) signalTree(pgid, added, 'SIGCONT');
           }
-          current = state();
+          // What was just found (or signalled) may have started others meanwhile: only a
+          // later scan that finds nothing new can show the tree empty.
+          current = { ...state(), empty: false };
         }
       }
       if (current.empty || performance.now() >= deadline) return current;
@@ -319,11 +322,17 @@ function nextMessage(supervisor, types, timeoutMs, label) {
   return new Promise((resolve, reject) => {
     const onMessage = message => { if (types.includes(message?.type)) { done(); resolve(message); } };
     const onExit = () => { done(); reject(new Error(`The process supervisor exited before it reported ${label}`)); };
+    // Spawning the supervisor itself can fail (EMFILE, EAGAIN): 'error' then comes without 'exit'.
+    const onError = error => { done(); reject(error); };
     const timer = setTimeout(() => { done(); reject(Object.assign(new Error(`The process supervisor did not report ${label}`),
       { code: 'SUPERVISOR_TIMEOUT' })); }, timeoutMs);
-    function done() { clearTimeout(timer); supervisor.off('message', onMessage); supervisor.off('exit', onExit); }
+    function done() {
+      clearTimeout(timer);
+      supervisor.off('message', onMessage); supervisor.off('exit', onExit); supervisor.off('error', onError);
+    }
     supervisor.on('message', onMessage);
     supervisor.once('exit', onExit);
+    supervisor.once('error', onError);
   });
 }
 
@@ -347,14 +356,19 @@ function taskkill(pid, force) {
  *   process dies first, the command never starts.
  * - onStart({ pid, identity, marker }): awaited once the command has started,
  *   for example to record its identity. Its failure is ignored.
- * - terminate({ graceMs, killWaitMs }): SIGTERM to the group, up to graceMs,
- *   then SIGKILL, up to killWaitMs. Resolves to a receipt whose `confirmed` is
- *   true only when the group is verifiably empty (members that exited and await
- *   reaping count as gone). Coverage is the process group: a descendant that
- *   started its own session or group is not covered.
+ *   If the go-ahead was sent but the start is never reported (the supervisor
+ *   died or timed out), it rejects with code START_UNCONFIRMED and the receipt
+ *   of stopping whatever may have started (see unconfirmedStart()).
+ * - terminate({ graceMs, killWaitMs }): freeze the tree (Linux), SIGTERM, up
+ *   to graceMs, freeze again, SIGKILL, up to killWaitMs (see stopTree()).
+ *   Resolves to a receipt whose `confirmed` is true only when the tree is
+ *   verifiably gone (members that exited and await reaping count as gone).
+ *   Coverage: on Linux the process group and every descendant, including those
+ *   that started their own session or group, found by parent links and by the
+ *   tree's environment marker; elsewhere on POSIX the process group only.
  * - If this process exits or dies without terminating the tree, the supervisor
- *   stops the group (orphanGraceMs, then SIGKILL). Nothing in the group outlives
- *   its owner, unless it left the group.
+ *   stops it the same way (orphanGraceMs, then SIGKILL): nothing it covers
+ *   outlives its owner.
  * - Windows has no process groups: the tree is stopped with taskkill /T, which
  *   cannot reach descendants whose parent already exited, so the receipt is
  *   never confirmed there.
@@ -369,11 +383,22 @@ export async function spawnSupervised(command, args = [], { cwd, env, stdio = 'i
   boundedMs(startTimeoutMs, 'startTimeoutMs', 1);
   boundedMs(trackIntervalMs, 'trackIntervalMs', 10);
   const streams = normalizeStdio(stdio);
+  if (cwd !== undefined && typeof cwd !== 'string') throw new TypeError('cwd must be a string');
+  // As child_process.spawn() treats it: undefined values are left out, others become strings.
+  // The supervisor receives it as JSON, which could not carry every value.
+  if (env !== undefined && (env === null || typeof env !== 'object')) throw new TypeError('env must be an object');
+  const environment = env === undefined ? undefined
+    : Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined).map(([name, value]) => [name, String(value)]));
 
   // The supervisor is in its own session: a signal to the owner's process group
   // (Ctrl-C, a runner killing the group) does not take it down with the owner.
   const supervisor = spawn(process.execPath, ['-e', SUPERVISOR],
     { stdio: [...streams, 'ipc'], detached: posix, windowsHide: true });
+  // A ChildProcess 'error' without a listener would crash this (owning) process:
+  // spawning can fail (EMFILE, EAGAIN), and so can a message to a supervisor
+  // that just exited. Startup failures are reported through nextMessage();
+  // later ones are covered by the exit report and termination receipts.
+  supervisor.on('error', () => {});
   const abandon = () => { if (supervisor.connected) supervisor.disconnect(); };
   // Listen for the exit report before the command can start: "started" and
   // "exit" of a short command can arrive in the same tick.
@@ -408,22 +433,53 @@ export async function spawnSupervised(command, args = [], { cwd, env, stdio = 'i
   // Inherited by every descendant: finds them even after they detached and lost their parent.
   const marker = `MNEMOS_TREE_${randomUUID().replaceAll('-', '')}`;
   let started;
+  let supervisorIdentity = null;
+  // Until the go-ahead is sent, a failure proves that the command never started.
+  // Afterwards only the supervisor's report can tell: without it, the command
+  // may have started (and may still run) although its start was never confirmed.
+  let goSent = false;
   try {
     await nextMessage(supervisor, ['ready'], startTimeoutMs, 'that it is ready');
-    const supervisorIdentity = processIdentity(supervisor.pid);
+    supervisorIdentity = processIdentity(supervisor.pid);
     if (beforeStart) await beforeStart({ supervisor: supervisorIdentity, marker });
     const reply = nextMessage(supervisor, ['started', 'error'], startTimeoutMs, 'the start of the command');
-    supervisor.send({ type: 'go', command, args, cwd, env, marker, graceMs: orphanGraceMs, killWaitMs: 2_000, trackIntervalMs });
+    // On a closed channel send() does not throw (it returns false); the reply then
+    // fails, and the start counts as unconfirmed.
+    supervisor.send({ type: 'go', command, args, cwd, env: environment, marker, graceMs: orphanGraceMs, killWaitMs: 2_000, trackIntervalMs });
+    goSent = true;
     started = await reply;
-    if (started.type === 'error') throw Object.assign(new Error(`spawn ${command} ${started.code}: ${started.message}`), { code: started.code });
   } catch (error) {
-    abandon(); // the command did not start; the supervisor exits
-    throw error;
+    abandon(); // a supervisor still connected stops whatever it started, then exits
+    if (!goSent) throw error;
+    throw await unconfirmedStart(error);
+  }
+  if (started.type === 'error') {
+    // The supervisor reports that spawning the command failed: it never started.
+    abandon();
+    throw Object.assign(new Error(`spawn ${command} ${started.code}: ${started.message}`), { code: started.code });
+  }
+
+  /**
+   * The go-ahead was sent but the start was never reported: the supervisor died
+   * or did not answer in time. The command may have started. On Linux, stop the
+   * supervisor (so it can start nothing more) and everything it started or that
+   * carries the tree's marker, with a receipt. Elsewhere nothing here can find
+   * the command; a supervisor that is still connected stops it on disconnect.
+   */
+  async function unconfirmedStart(cause) {
+    let termination = { confirmed: false, method: 'none', coverage: 'none', marker, verifiedAt: new Date().toISOString() };
+    if (process.platform === 'linux') {
+      const roots = supervisorIdentity?.startTicks ? [[supervisor.pid, supervisorIdentity.startTicks]] : [];
+      const result = await stopTree(null, marker, roots, orphanGraceMs, 2_000);
+      termination = { confirmed: result.confirmed, method: 'marker', coverage: 'supervisor-descendants+marker', marker,
+        signals: result.signals, frozen: result.frozen, survivors: result.survivors, verifiedAt: new Date().toISOString() };
+    }
+    return Object.assign(new Error(`The start of ${command} was not confirmed: ${cause.message}`, { cause }),
+      { code: 'START_UNCONFIRMED', startUnconfirmed: true, marker, termination });
   }
 
   const pid = started.pid;
   const identity = processIdentity(pid); // null if it already exited
-  const supervisorIdentity = processIdentity(supervisor.pid);
   // The command runs: a failure to record it must not hide it from the caller.
   if (onStart) { try { await onStart({ pid, identity, marker }); } catch { /* recorded by marker already */ } }
   let termination;
@@ -505,10 +561,18 @@ export async function spawnSupervised(command, args = [], { cwd, env, stdio = 'i
  *   outlives the job.
  * - The command never started (it cannot be spawned, or the job was aborted
  *   first): FAILED or CANCELLED with effectAbsent: true.
+ * - Piped stdout and stderr are always read (a pipe nobody reads fills up and
+ *   blocks the command): each chunk goes to onOutput(chunk, 'stdout' | 'stderr')
+ *   if given, and is discarded otherwise. Once the command has ended, the result
+ *   says whether all output arrived (outputComplete: the pipes closed within 2 s).
+ * - Its start was not confirmed (the go-ahead was sent, but the supervisor
+ *   died or did not report in time): UNKNOWN with startUnconfirmed: true and
+ *   the receipt of stopping whatever may have started. Never effect-free.
  */
 export async function runSupervised({ command, args = [], signal, cwd, env, stdio = 'ignore', beforeStart, onStart,
-  graceMs = 5_000, killWaitMs = 5_000, trackIntervalMs } = {}) {
+  onOutput, graceMs = 5_000, killWaitMs = 5_000, trackIntervalMs } = {}) {
   if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');
+  if (onOutput !== undefined && typeof onOutput !== 'function') throw new TypeError('onOutput must be a function');
   boundedMs(graceMs, 'graceMs');
   boundedMs(killWaitMs, 'killWaitMs');
   const notStarted = { status: 'CANCELLED', termination: { confirmed: true, method: 'not-started' }, effectAbsent: true };
@@ -518,9 +582,14 @@ export async function runSupervised({ command, args = [], signal, cwd, env, stdi
     tree = await spawnSupervised(command, args, { cwd, env, stdio, beforeStart, onStart, trackIntervalMs });
   } catch (error) {
     if (error instanceof TypeError) throw error;
+    // The go-ahead was sent but the start never confirmed: the command may have run.
+    if (error.code === 'START_UNCONFIRMED') {
+      return { status: 'UNKNOWN', startUnconfirmed: true, marker: error.marker, termination: error.termination };
+    }
     // Nothing was started: the supervisor reported the spawn failure, or never got the go-ahead.
     return { status: 'FAILED', effectAbsent: true, spawnError: typeof error.code === 'string' ? error.code : 'SPAWN_FAILED' };
   }
+  const output = readOutput(tree, onOutput);
   let onAbort;
   const aborted = new Promise(resolve => {
     onAbort = resolve;
@@ -530,7 +599,36 @@ export async function runSupervised({ command, args = [], signal, cwd, env, stdi
   const first = await Promise.race([tree.exited.then(() => 'exited'), aborted.then(() => 'aborted')]);
   signal?.removeEventListener('abort', onAbort);
   const receipt = await tree.terminate({ graceMs, killWaitMs });
-  if (first === 'aborted') return { status: 'CANCELLED', termination: receipt };
+  const outputComplete = await output.closed(OUTPUT_CLOSE_WAIT_MS);
+  const reported = outputComplete === null ? {} : { outputComplete };
+  if (first === 'aborted') return { status: 'CANCELLED', termination: receipt, ...reported };
   const { code, signal: exitSignal } = receipt.leaderExit ?? await tree.exited;
-  return { status: code === 0 ? 'COMPLETED' : 'FAILED', exitCode: code, exitSignal, cleanup: receipt };
+  return { status: code === 0 ? 'COMPLETED' : 'FAILED', exitCode: code, exitSignal, cleanup: receipt, ...reported };
+}
+
+const OUTPUT_CLOSE_WAIT_MS = 2_000;
+
+// Read the tree's piped stdout and stderr from the start. closed(ms) resolves to
+// whether every pipe closed (all output arrived, and onOutput never failed)
+// within ms, or null when nothing is piped. A failing onOutput is not called
+// again; its stream is still drained, so the command is never blocked.
+function readOutput(tree, onOutput) {
+  const streams = [['stdout', tree.stdout], ['stderr', tree.stderr]].filter(([, stream]) => stream);
+  if (streams.length === 0) return { closed: async () => null };
+  let failed = false;
+  const closed = Promise.all(streams.map(([name, stream]) => new Promise(resolve => {
+    stream.on('data', chunk => {
+      if (!onOutput || failed) return;
+      try { onOutput(chunk, name); } catch { failed = true; }
+    });
+    stream.once('close', resolve);
+  })));
+  return {
+    async closed(waitMs) {
+      let timer;
+      const done = await Promise.race([closed.then(() => true), new Promise(resolve => { timer = setTimeout(() => resolve(false), waitMs); })]);
+      clearTimeout(timer);
+      return done && !failed;
+    }
+  };
 }

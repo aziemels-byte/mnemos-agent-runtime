@@ -7,9 +7,9 @@ import { hostname } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { FilePhaseJobRegistry } from '../src/index.mjs';
-import { identityState, processIdentity } from '../src/directory-lock.mjs';
+import { identityState, processIdentity } from '../src/process-identity.mjs';
 import { FileJobStore } from '../src/job-store.mjs';
-import { temporaryDirectory, withTimeout } from './helpers.mjs';
+import { temporaryDirectory, until, withTimeout } from './helpers.mjs';
 
 const linux = process.platform === 'linux';
 const forever = 'setInterval(() => {}, 1000);';
@@ -19,13 +19,6 @@ const kill = pid => { try { process.kill(pid, 'SIGKILL'); } catch {} };
 const killGroup = pgid => { try { process.kill(-pgid, 'SIGKILL'); } catch {} };
 const gone = pid => identityState({ pid, host: hostname() }) === 'DEAD';
 
-async function until(predicate, label, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-    await sleep(20);
-  }
-}
 
 // The job's command: a leader with a grandchild in its group and an escapee in its
 // own session (keeping the environment), each recording its PID once running.

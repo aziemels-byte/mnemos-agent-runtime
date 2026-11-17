@@ -5,7 +5,10 @@ import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { FileIdempotencyRegistry, IdempotencyRegistry } from '../src/index.mjs';
-import { temporaryDirectory } from './helpers.mjs';
+import { DirectoryLock } from '../src/directory-lock.mjs';
+import { processIdentity } from '../src/process-identity.mjs';
+import { spawn } from 'node:child_process';
+import { deferred, failFsPromises, temporaryDirectory, workerThread } from './helpers.mjs';
 
 class Journal {
   constructor() { this.events = []; this.failType = null; }
@@ -14,10 +17,6 @@ class Journal {
     this.events.push({ type, key, data: structuredClone(data) });
   }
   async listEvents({ typePrefix }) { return structuredClone(this.events.filter(x => x.type.startsWith(typePrefix))); }
-}
-
-function deferred() {
-  return Promise.withResolvers();
 }
 
 // Capture the journal snapshot before pausing, just like an asynchronous read.
@@ -411,4 +410,154 @@ test('file registry: unreadable or mismatched records fail closed and never run 
   await writeFile(recordFile(directory, 'effect:b'), valid);
   await assert.rejects(registry.execute({ key: 'effect:b', operation: must }), error => error.code === 'IDEMPOTENCY_STATE_INVALID');
   await assert.rejects(registry.snapshot(), error => error.code === 'IDEMPOTENCY_STATE_INVALID');
+});
+
+// Guard for the B7 fix: records written with the current fingerprint keep working.
+test('file registry: a record fingerprinted by an earlier version still replays and never runs again', async t => {
+  const directory = await temporaryDirectory(t);
+  const key = 'report:legacy';
+  const request = { week: 7, format: 'pdf' }; // key order as the earlier version saw it
+  const record = { key, fingerprint: createHash('sha256').update(JSON.stringify(request)).digest('hex'), state: 'COMPLETED',
+    startedAt: new Date().toISOString(), completedAt: new Date().toISOString(), attempt: 1, result: 'stored', reconciliationRequired: false };
+  await writeFile(recordFile(directory, key), JSON.stringify({ schema: 'mnemos.idempotency-record.v1', record }));
+  const outcome = await new FileIdempotencyRegistry({ directory }).execute({ key, request: { week: 7, format: 'pdf' },
+    operation: () => { throw Error('must not execute'); } });
+  assert.deepEqual([outcome.status, outcome.result], ['IDEMPOTENT_REPLAY', 'stored']);
+});
+
+// Key order (B7), a journal that fails after a failure (B10), an unlock that fails
+// (B8) and an outcome recorded late (B9).
+
+test('requests that differ only in key order are the same request, as for job inputs', async t => {
+  const directory = await temporaryDirectory(t);
+  for (const registry of [new IdempotencyRegistry(), new FileIdempotencyRegistry({ directory })]) {
+    let runs = 0;
+    const operation = async () => ++runs;
+    await registry.execute({ key: 'import:item-3', request: { item: 3, batch: 'b1' }, operation });
+    const again = await registry.execute({ key: 'import:item-3', request: { batch: 'b1', item: 3 }, operation });
+    assert.deepEqual([again.status, runs], ['IDEMPOTENT_REPLAY', 1], registry.constructor.name);
+  }
+});
+
+test('a failure whose journal write also fails still carries its idempotency status, and never runs again', async () => {
+  const journal = new Journal();
+  journal.failType = 'idempotency.unknown';
+  const registry = new IdempotencyRegistry({ store: journal });
+  let runs = 0;
+  const operation = async () => { runs++; throw new Error('upstream connection reset'); };
+  await assert.rejects(registry.execute({ key: 'charge:42', operation }),
+    error => error.idempotency?.status === 'IDEMPOTENCY_UNKNOWN' && /upstream connection reset/.test(error.message));
+  const again = await registry.execute({ key: 'charge:42', operation });
+  assert.deepEqual([again.status, runs], ['IDEMPOTENCY_UNKNOWN', 1]);
+});
+
+test('file registry: a lock that could not be released never strands a key IN_PROGRESS', async t => {
+  const directory = await temporaryDirectory(t);
+  const effects = new FileIdempotencyRegistry({ directory, lockTimeoutMs: 500 });
+  failFsPromises(t, 'rm', target => target === effects.lockFile); // the unlock after STARTED is recorded
+  let runs = 0;
+  const operation = async () => ++runs;
+  const first = await effects.execute({ key: 'report:weekly', operation });
+  assert.deepEqual([first.status, runs], ['IDEMPOTENCY_EXECUTED', 1]);
+  const again = await effects.execute({ key: 'report:weekly', operation });
+  assert.deepEqual([again.status, again.result, runs], ['IDEMPOTENT_REPLAY', 1, 1]);
+});
+
+test('file registry: a completed outcome that could not be recorded at first is recorded, not downgraded to UNKNOWN', async t => {
+  const directory = await temporaryDirectory(t);
+  const effects = new FileIdempotencyRegistry({ directory, lockTimeoutMs: 200 });
+  // Another holder keeps the lock while the outcome would be recorded.
+  const holder = new DirectoryLock({ directory, name: 'idempotency.lock', timeoutMs: 5_000 });
+  const free = deferred();
+  let held;
+  const request = { week: 7 };
+  const first = await effects.execute({ key: 'report:weekly', request, operation: async () => {
+    const acquired = deferred();
+    held = holder.run(async () => { acquired.resolve(); await free.promise; });
+    await acquired.promise;
+    return { rows: 3 };
+  } }).then(outcome => outcome.status, error => error.idempotency?.status);
+  assert.ok(['IDEMPOTENCY_EXECUTED', 'IDEMPOTENCY_UNKNOWN'].includes(first), first);
+  free.resolve();
+  await held;
+  let record;
+  for (const deadline = Date.now() + 5_000; ; await new Promise(resolve => setTimeout(resolve, 20))) {
+    record = await effects.inspect('report:weekly');
+    if (record.state !== 'STARTED' || Date.now() > deadline) break;
+  }
+  assert.deepEqual([record.state, record.result], ['COMPLETED', { rows: 3 }]);
+  const replay = await effects.execute({ key: 'report:weekly', request, operation: () => { throw Error('must not execute'); } });
+  assert.equal(replay.status, 'IDEMPOTENT_REPLAY');
+});
+
+test('file registry: an effect running in another thread of this process is in progress, never UNKNOWN', async t => {
+  const directory = await temporaryDirectory(t);
+  const worker = workerThread(t, `
+    const { FileIdempotencyRegistry } = await import(workerData.indexUrl);
+    const effects = new FileIdempotencyRegistry({ directory: workerData.directory });
+    const outcome = effects.execute({ key: 'report:weekly', request: { week: 7 },
+      operation: () => new Promise(resolve => { parentPort.postMessage('running'); parentPort.once('message', () => resolve('report')); }) });
+    parentPort.postMessage((await outcome).status);`,
+  { directory, indexUrl: new URL('../src/index.mjs', import.meta.url).href });
+  assert.equal(await worker.next(), 'running');
+  const effects = new FileIdempotencyRegistry({ directory });
+  const must = () => { throw Error('must not execute'); };
+  assert.equal((await effects.inspect('report:weekly')).ownerState, 'ALIVE');
+  assert.equal((await effects.execute({ key: 'report:weekly', request: { week: 7 }, operation: must })).status, 'IDEMPOTENCY_IN_PROGRESS');
+  const finished = worker.next();
+  worker.send('finish');
+  assert.equal(await finished, 'IDEMPOTENCY_EXECUTED');
+  const replay = await effects.execute({ key: 'report:weekly', request: { week: 7 }, operation: must });
+  assert.deepEqual([replay.status, replay.result], ['IDEMPOTENT_REPLAY', 'report']);
+});
+
+test('file registry: owners are recorded with their identity and thread', async t => {
+  const directory = await temporaryDirectory(t);
+  const effects = new FileIdempotencyRegistry({ directory });
+  let owner;
+  await effects.execute({ key: 'report:weekly', operation: async () => { owner = (await effects.inspect('report:weekly')).owner; } });
+  const { bootId, startTicks } = processIdentity(process.pid);
+  assert.deepEqual(owner, { pid: process.pid, host: hostname(), executionId: owner.executionId, threadId: 0,
+    ...(startTicks === undefined ? {} : { bootId, startTicks }) });
+});
+
+test('file registry: a dead owner whose PID now belongs to another process is recognized, not IN_PROGRESS',
+  { skip: process.platform !== 'linux' }, async t => {
+  const directory = await temporaryDirectory(t);
+  const other = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  t.after(() => other.kill('SIGKILL'));
+  await new Promise(resolve => other.once('spawn', resolve));
+  const identity = processIdentity(other.pid);
+  const effects = new FileIdempotencyRegistry({ directory });
+  const must = () => { throw Error('must not execute'); };
+  const started = (key, startTicks) => writeFile(recordFile(directory, key), JSON.stringify({ schema: 'mnemos.idempotency-record.v1',
+    record: { key, fingerprint: createHash('sha256').update('{}').digest('hex'), state: 'STARTED', startedAt: new Date().toISOString(),
+      attempt: 1, owner: { ...identity, startTicks, executionId: 'elsewhere', threadId: 0 } } }));
+  // Guard: the same process (same start time) is alive: in progress, never interrupted.
+  await started('effect:live', identity.startTicks);
+  assert.equal((await effects.inspect('effect:live')).ownerState, 'ALIVE');
+  assert.equal((await effects.execute({ key: 'effect:live', operation: must })).status, 'IDEMPOTENCY_IN_PROGRESS');
+  // Another start time: that owner died and its PID was reused. UNKNOWN, never run again.
+  await started('effect:reused', String(BigInt(identity.startTicks) - 1n));
+  assert.equal((await effects.inspect('effect:reused')).ownerState, 'DEAD');
+  assert.equal((await effects.execute({ key: 'effect:reused', operation: must })).status, 'IDEMPOTENCY_UNKNOWN');
+  assert.equal((await effects.inspect('effect:reused')).reason, 'INTERRUPTED_AFTER_EFFECT_START');
+});
+
+test('a journal written by an earlier version still replays its results after restore', async () => {
+  const journal = new Journal();
+  const request = { week: 7, format: 'pdf' }; // fingerprinted with this key order by the earlier version
+  const record = { key: 'report:legacy', fingerprint: createHash('sha256').update(JSON.stringify(request)).digest('hex'),
+    state: 'COMPLETED', startedAt: new Date().toISOString(), attempt: 1, result: 'stored', reconciliationRequired: false };
+  await journal.appendEvent('idempotency.completed', record.key, { record });
+  const registry = new IdempotencyRegistry({ store: journal });
+  await registry.restore();
+  const must = () => { throw Error('must not execute'); };
+  const outcome = await registry.execute({ key: 'report:legacy', request: { week: 7, format: 'pdf' }, operation: must });
+  assert.deepEqual([outcome.status, outcome.result], ['IDEMPOTENT_REPLAY', 'stored']);
+  // An earlier record keeps its rule: its fingerprint names one key order, so another order is a
+  // conflict, as it was then (fails closed; never runs). Records written now accept any order.
+  assert.equal((await registry.execute({ key: 'report:legacy', request: { format: 'pdf', week: 7 }, operation: must })).status,
+    'IDEMPOTENCY_CONFLICT');
+  assert.equal((await registry.execute({ key: 'report:legacy', request: { week: 8 }, operation: must })).status, 'IDEMPOTENCY_CONFLICT');
 });

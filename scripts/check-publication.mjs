@@ -8,16 +8,16 @@ const allowed = new Set([
   '.gitattributes', '.gitignore', '.github/workflows/ci.yml',
   'LICENSE', 'README.md', 'PROVENANCE.md', 'SECURITY.md', 'package.json', 'package-lock.json',
   'src/index.mjs', 'src/candidate-verifier.mjs', 'src/phase-job-registry.mjs',
-  'src/provider-failure.mjs', 'src/secret-filter.mjs', 'src/checkpoint-recovery.mjs',
-  'src/idempotency-registry.mjs', 'src/resource-lease-manager.mjs', 'src/directory-lock.mjs', 'src/job-store.mjs', 'src/file-phase-job-registry.mjs', 'src/process-tree.mjs', 'src/quality-gate.mjs',
+  'src/provider-failure.mjs', 'src/provider-calls.mjs', 'src/secret-filter.mjs', 'src/checkpoint-recovery.mjs',
+  'src/idempotency-registry.mjs', 'src/resource-lease-manager.mjs', 'src/directory-lock.mjs', 'src/process-identity.mjs', 'src/job-store.mjs', 'src/job-history.mjs', 'src/file-phase-job-registry.mjs', 'src/process-tree.mjs', 'src/quality-gate.mjs', 'src/test-evidence.mjs',
   'test/helpers.mjs', 'test/candidate-verifier.test.mjs', 'test/phase-job-registry.test.mjs',
-  'test/provider-failure.test.mjs', 'test/checkpoint-recovery.test.mjs', 'test/examples.test.mjs',
+  'test/provider-failure.test.mjs', 'test/provider-calls.test.mjs', 'test/checkpoint-recovery.test.mjs', 'test/examples.test.mjs',
   'test/idempotency-registry.test.mjs', 'test/resource-lease-manager.test.mjs',
   'test/resource-lease-cross-process.test.mjs', 'test/checkpoint-cross-process.test.mjs',
-  'test/idempotency-cross-process.test.mjs', 'test/job-store.test.mjs', 'test/file-phase-job-registry.test.mjs', 'test/job-recovery.test.mjs', 'test/process-identity.test.mjs', 'test/process-tree.test.mjs', 'test/orphans.test.mjs', 'test/resume.test.mjs', 'test/quality-gate.test.mjs',
+  'test/idempotency-cross-process.test.mjs', 'test/job-store.test.mjs', 'test/job-history.test.mjs', 'test/file-phase-job-registry.test.mjs', 'test/job-recovery.test.mjs', 'test/process-identity.test.mjs', 'test/process-tree.test.mjs', 'test/orphans.test.mjs', 'test/resume.test.mjs', 'test/quality-gate.test.mjs', 'test/test-evidence.test.mjs',
   'examples/run.mjs', 'examples/verify-candidate.mjs', 'examples/recoverable-task.mjs',
   'examples/lease-and-idempotency.mjs', 'examples/quality-gate.mjs', 'examples/cross-process.mjs',
-  'scripts/check-publication.mjs'
+  'scripts/check-publication.mjs', 'scripts/verify.mjs', 'scripts/verify-reliability.mjs'
 ]);
 const problems = [];
 const found = new Set();
@@ -29,6 +29,21 @@ const privatePatterns = [
   ['credential-looking token', /\b(?:gh[pousr]_|github_pat_|sk-(?:proj-)?)[A-Za-z0-9_-]{20,}/],
   ['private key payload', /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\s+[A-Za-z0-9+/=]{20,}/]
 ];
+
+// Every literal module specifier: of static imports and re-exports (the string
+// after from), side-effect imports, dynamic import() and require() calls. A word
+// inside a string, such as a job named import, is not an import. Specifiers
+// computed at run time cannot be checked here; the files they load are checked
+// as files of the repository.
+const SPECIFIER_PATTERNS = [
+  /\bfrom\s*(['"])([^'"\n]+)\1/g,
+  /(?:^|[^.\w'"`$])import\s*(['"])([^'"\n]+)\1/gm,
+  /\bimport\s*\(\s*(['"`])([^'"`\n]+)\1/g,
+  /\brequire\s*\(\s*(['"`])([^'"`\n]+)\1/g
+];
+function moduleSpecifiers(text) {
+  return SPECIFIER_PATTERNS.flatMap(pattern => [...text.matchAll(pattern)].map(match => match[2]));
+}
 
 async function visit(directory, relative = '') {
   for (const name of await readdir(directory)) {
@@ -51,7 +66,7 @@ async function visit(directory, relative = '') {
       if (!match[0].endsWith('.invalid')) problems.push(`${entry}: non-fixture email address`);
     }
     if (entry.endsWith('.mjs')) {
-      const specifiers = [...text.matchAll(/(?:\bfrom\s*|\bimport\s*)['"]([^'"]+)['"]/g)].map(match => match[1]);
+      const specifiers = moduleSpecifiers(text);
       for (const specifier of specifiers) {
         if (specifier.startsWith('node:') && isBuiltin(specifier)) continue;
         if (!specifier.startsWith('.')) { problems.push(`${entry}: external import`); continue; }
@@ -60,7 +75,8 @@ async function visit(directory, relative = '') {
         if (relativeImport.startsWith('..') || path.isAbsolute(relativeImport)) {
           problems.push(`${entry}: import escapes repository`); continue;
         }
-        if (!(await lstat(resolved)).isFile()) problems.push(`${entry}: invalid local import`);
+        const target = await lstat(resolved).catch(() => null); // a missing file is a problem to report, not a crash
+        if (!target?.isFile()) problems.push(`${entry}: invalid local import`);
       }
     }
   }

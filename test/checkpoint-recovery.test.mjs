@@ -56,7 +56,7 @@ test('serial writes leave complete JSON and no temporary files', async t => {
 test('oversized writes preserve the last valid checkpoint', async t => {
   const store = new FileCheckpointStore(await temporaryDirectory(t));
   await store.save({ valid: true });
-  assert.throws(() => store.save({ text: 'x'.repeat(1024 * 1024) }), RangeError);
+  await assert.rejects(store.save({ text: 'x'.repeat(1024 * 1024) }), RangeError);
   assert.deepEqual(await store.load(), { valid: true });
 });
 
@@ -85,7 +85,7 @@ test('conditional saves replace only the revision the caller last read', async t
 
   // Unconditional saves keep their previous behaviour.
   assert.match((await store.save({ step: 3 })).revision, /^[0-9a-f]{64}$/);
-  for (const invalid of ['abc', 5, {}]) assert.throws(() => store.save({}, { expectedRevision: invalid }), TypeError);
+  for (const invalid of ['abc', 5, {}]) await assert.rejects(store.save({}, { expectedRevision: invalid }), TypeError);
   assert.deepEqual(await readdir(store.directory), ['checkpoint.json']);
 });
 
@@ -346,4 +346,16 @@ test('every job ID a checkpoint accepts is a valid registry job ID', async t => 
     await assert.rejects(coordinator.checkpoint({ goal: { goalId: 'goal' }, activeJobs: [{ id }] }), /Invalid checkpoint/);
     assert.throws(() => registry.get(id), /Invalid job ID/);
   }
+});
+
+test('save() reports invalid arguments through its promise, like every other failure', async t => {
+  const store = new FileCheckpointStore(await temporaryDirectory(t));
+  await store.save({ valid: true });
+  let saving;
+  assert.doesNotThrow(() => { saving = store.save({ text: 'x'.repeat(1024 * 1024) }); });
+  await assert.rejects(saving, RangeError);
+  assert.doesNotThrow(() => { saving = store.save({}, { expectedRevision: 'not-a-revision' }); });
+  await assert.rejects(saving, TypeError);
+  for (const value of [undefined, () => {}]) await assert.rejects(store.save(value), TypeError); // would store the text "undefined"
+  assert.deepEqual(await store.load(), { valid: true });
 });

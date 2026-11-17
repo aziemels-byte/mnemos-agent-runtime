@@ -3,6 +3,15 @@
 export const VALID_JOB_ID = /^[a-z0-9][a-z0-9_-]{0,127}$/i;
 export const VALID_PHASE = /^[a-z][a-z0-9_]{1,63}$/i;
 
+/** An error carrying a JOB_* code and details, as both registries report them. */
+export const jobError = (code, message, details = {}) => Object.assign(new Error(message), { code, ...details });
+
+/** The job ID, if it follows the grammar above; a TypeError otherwise. */
+export function requireJobId(jobId) {
+  if (typeof jobId !== 'string' || !VALID_JOB_ID.test(jobId)) throw new TypeError('Invalid job ID');
+  return jobId;
+}
+
 /** A detached copy of plain JSON data with sorted keys; throws for anything else. */
 export function jsonInput(value, depth = 0) {
   if (depth > 32) throw new TypeError('input exceeds maximum JSON depth');
@@ -26,7 +35,9 @@ export const CANCELLED_BEFORE_DISPATCH = Object.freeze(
 /**
  * The outcome of an executor's report, shared by the in-memory and the
  * file-backed registry. A cancellation counts as confirmed only with a
- * termination receipt; otherwise an aborted job is UNKNOWN. effectAbsent (a
+ * termination receipt; otherwise an aborted job is UNKNOWN. An executor that
+ * cannot tell whether its effect happened reports UNKNOWN (for example
+ * runSupervised when a command's start was not confirmed). effectAbsent (a
  * retry is safe) is true only when the executor explicitly reports it for a
  * FAILED or confirmed CANCELLED job. Reading the report may throw (hostile
  * getters); callers then use thrownOutcome().
@@ -39,6 +50,7 @@ export function settlementOutcome(result, aborted) {
     return outcome('CANCELLED', 'CANCELLED_BY_REQUEST', { cancellationConfirmed: true, effectAbsent });
   }
   if (aborted && reported !== 'COMPLETED') return outcome('UNKNOWN', 'CANCELLATION_UNCONFIRMED');
+  if (reported === 'UNKNOWN') return outcome('UNKNOWN', 'EXECUTOR_REPORTED_UNKNOWN');
   if (reported === 'COMPLETED') return outcome('COMPLETED', null);
   if (reported === 'FAILED') return outcome('FAILED', 'EXECUTOR_REPORTED_FAILURE', { effectAbsent });
   return outcome('FAILED', 'EXECUTOR_STATUS_UNEXPECTED');
@@ -51,7 +63,6 @@ export function thrownOutcome(aborted) {
 
 export const MAX_EVIDENCE_BYTES = 8 * 1024;
 export const RECONCILED_STATUSES = Object.freeze(['COMPLETED', 'FAILED', 'CANCELLED']);
-const jobError = (code, message, details = {}) => Object.assign(new Error(message), { code, ...details });
 
 /**
  * Validate a reconciliation request shared by both registries. Evidence must be
@@ -125,8 +136,7 @@ export class PhaseJobRegistry {
   }
 
   #lookup(id) {
-    if (typeof id !== 'string' || !VALID_JOB_ID.test(id)) throw new TypeError('Invalid job ID');
-    return this.#jobs.get(id);
+    return this.#jobs.get(requireJobId(id));
   }
 
   #snapshot(job) {

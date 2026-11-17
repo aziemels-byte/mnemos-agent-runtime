@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { link, mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { ownIdentityFields, recordedProcessState } from './process-identity.mjs';
 
 // Internal module shared by the file-backed stores. Not exported from index.mjs.
 
@@ -18,103 +18,13 @@ const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP', 'EISDIR', 'EBAD
 const WAITER_TEMPORARY = new RegExp(`^${UUID_PATTERN}(?:\\.(\\d+))?\\.lock\\.tmp$`);
 const sha256 = text => createHash('sha256').update(text).digest('hex');
 const lockError = (code, message, details = {}) => Object.assign(new Error(message), { code, ...details });
-const ownerRecord = () => JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString() });
+// Lock records, break claims and waiters' temporaries name their writer. On
+// Linux they also carry its boot ID and start time, so that a record left by an
+// earlier process that had the same PID (a restarted container's PID 1, or any
+// reused PID) is recognized as dead; see recordedProcessState().
+const writerRecord = fields => JSON.stringify({ ...fields, pid: process.pid, host: hostname(), ...ownIdentityFields() });
+const ownerRecord = () => writerRecord({ at: new Date().toISOString() });
 const validToken = token => typeof token === 'string' && TOKEN.test(token);
-
-// Linux: a process that has exited but was not yet reaped by its parent (a
-// zombie, state Z; or X while being reaped) still answers kill(pid, 0). Under an
-// init that reaps slowly or never (for example a container without --init) it
-// would look alive indefinitely. True only for a definite zombie; any doubt
-// (no procfs, unreadable, unexpected format) keeps the process alive.
-function exitedButUnreaped(pid) {
-  const state = procStat(pid)?.[0];
-  return state === 'Z' || state === 'X';
-}
-
-// Linux: the fields of /proc/<pid>/stat after "pid (comm)", starting with the
-// state (field 3); comm may contain spaces and parentheses. Null when unavailable.
-function procStat(pid) {
-  if (process.platform !== 'linux') return null;
-  let stat;
-  try { stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); }
-  catch { return null; }
-  const end = stat.lastIndexOf(')');
-  return end < 0 ? null : stat.slice(end + 2).trim().split(' ');
-}
-
-const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const TICKS = /^\d{1,20}$/;
-let cachedBootId;
-function bootId() {
-  if (process.platform !== 'linux') return null;
-  if (cachedBootId === undefined) {
-    try {
-      const id = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-      cachedBootId = BOOT_ID.test(id) ? id : null;
-    } catch { cachedBootId = null; }
-  }
-  return cachedBootId;
-}
-
-/**
- * Who a process is, so that a later check can tell it from an unrelated
- * process that reused its PID: { pid, host } and, on Linux, the boot ID and the
- * process start time in clock ticks since boot (field 22 of /proc/<pid>/stat).
- * Elsewhere only { pid, host }. Null when no such process is running.
- */
-export function processIdentity(pid = process.pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) throw new TypeError('Invalid PID');
-  if (pid !== process.pid) {
-    try { process.kill(pid, 0); }
-    catch (error) { if (error.code === 'ESRCH') return null; }
-  }
-  const identity = { pid, host: hostname() };
-  const fields = procStat(pid);
-  if (fields && ['Z', 'X'].includes(fields[0])) return null; // exited, awaiting reaping
-  const boot = bootId();
-  if (fields && boot && TICKS.test(fields[19] ?? '')) {
-    identity.bootId = boot;
-    identity.startTicks = fields[19];
-  }
-  return identity;
-}
-
-/**
- * Whether the process an identity describes is still running:
- * - ALIVE: the same process, verified by boot ID and start time.
- * - DEAD: provably gone (PID gone or a zombie, the host rebooted, or the PID now
- *   belongs to a process that started at another time).
- * - UNVERIFIED: a process with this PID runs, but the identity has no start time
- *   to compare (recorded elsewhere than Linux, or by an older version). It may be
- *   the same process or an unrelated one: never signal it on this evidence.
- * - OTHER_HOST, UNREADABLE: as processState().
- */
-export function identityState(identity) {
-  const basic = processState(identity);
-  if (basic === 'OTHER_HOST' || basic === 'UNREADABLE') return basic;
-  const recorded = identity.bootId !== undefined || identity.startTicks !== undefined;
-  if (recorded && !(typeof identity.bootId === 'string' && BOOT_ID.test(identity.bootId) &&
-    typeof identity.startTicks === 'string' && TICKS.test(identity.startTicks))) return 'UNREADABLE';
-  if (recorded && bootId() !== null && identity.bootId !== bootId()) return 'DEAD'; // rebooted since
-  if (basic === 'DEAD') return 'DEAD';
-  const current = processIdentity(identity.pid);
-  if (current === null) return 'DEAD';
-  if (!recorded || current.startTicks === undefined) return 'UNVERIFIED';
-  return current.startTicks === identity.startTicks ? 'ALIVE' : 'DEAD';
-}
-
-// A process is provably gone only when it ran on this host and its PID no
-// longer exists, or it has exited and only awaits reaping. Anything else
-// (other host, unreadable record, live or unknown PID) is treated as live: a
-// stuck lock is recoverable, a double grant is not.
-export function processState(record) {
-  if (!Number.isSafeInteger(record?.pid) || record.pid <= 0 || typeof record.host !== 'string') return 'UNREADABLE';
-  if (record.host !== hostname()) return 'OTHER_HOST';
-  if (record.pid === process.pid) return 'ALIVE';
-  try { process.kill(record.pid, 0); }
-  catch (error) { return error.code === 'ESRCH' ? 'DEAD' : 'ALIVE'; }
-  return exitedButUnreaped(record.pid) ? 'DEAD' : 'ALIVE';
-}
 
 /**
  * Flush a directory's entries (creations, renames) to stable storage, so that a
@@ -167,6 +77,45 @@ export async function replaceFile(target, text, suffix, { syncDirectory: flushDi
 }
 
 /**
+ * Call `retry` in the background after the backoff for `attempt` (25 ms,
+ * doubling, at most 2 s), without keeping the process alive. The one retry
+ * policy of the file-backed stores, and only for rewriting state under a
+ * condition that makes a repeat harmless: a record still owned by this
+ * execution (compare-and-swap), a lock still carrying this token. Never use it
+ * to repeat an effect: an effect whose outcome is unknown is UNKNOWN.
+ */
+export function retryLater(attempt, retry) {
+  const timer = setTimeout(retry, Math.min(25 * 2 ** attempt, 2_000));
+  timer.unref?.();
+}
+
+/**
+ * The bytes of a state file, or null when it does not exist. A path that is not
+ * a regular file, or a file larger than maxBytes (also one that grows while it
+ * is read), is rejected with the error invalid(reason) returns, reason being
+ * 'NOT_A_FILE' or 'TOO_LARGE': state is never read without bound, and never
+ * treated as absent unless it is.
+ */
+export async function readBoundedFile(file, maxBytes, invalid) {
+  let handle;
+  try { handle = await open(file, 'r'); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw invalid('NOT_A_FILE');
+    if (stat.size > maxBytes) throw invalid('TOO_LARGE');
+    const bytes = await handle.readFile();
+    if (bytes.length > maxBytes) throw invalid('TOO_LARGE');
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
  * Same-host mutual exclusion through one lock file in a directory.
  * - link() publishes a fully written lock record atomically and fails if a lock exists.
  * - A lock is broken automatically only when its holder ran on this host and its
@@ -192,7 +141,11 @@ export class DirectoryLock {
     this.#claim = new RegExp(`^${escaped}\\.(${UUID_PATTERN})\\.break$`);
   }
 
-  /** Run `operation` while holding the lock; housekeeping runs first. */
+  /**
+   * Run `operation` while holding the lock; housekeeping runs first. Resolves or
+   * rejects with the operation's own outcome: a failure to unlock afterwards
+   * never replaces it (see #release).
+   */
   async run(operation) {
     const token = await this.#acquire();
     try {
@@ -214,7 +167,7 @@ export class DirectoryLock {
       if (!match) continue;
       let claimant = null;
       try { claimant = JSON.parse(await readFile(path.join(this.directory, name), 'utf8')); } catch { /* unreadable */ }
-      pendingBreaks.push({ token: match[1], claimant, claimantState: processState(claimant) });
+      pendingBreaks.push({ token: match[1], claimant, claimantState: recordedProcessState(claimant) });
     }
     let text;
     try { text = await readFile(this.lockFile); }
@@ -225,10 +178,13 @@ export class DirectoryLock {
     let holder = null;
     try {
       const record = JSON.parse(text);
-      if (validToken(record?.token)) holder = { token: record.token, pid: record.pid, host: record.host, lockedAt: record.lockedAt };
+      if (validToken(record?.token)) {
+        holder = { token: record.token, pid: record.pid, host: record.host, lockedAt: record.lockedAt };
+        for (const field of ['bootId', 'startTicks']) if (record[field] !== undefined) holder[field] = record[field];
+      }
     } catch { /* reported as UNREADABLE */ }
     return { status: 'LOCKED', lockFile: this.lockFile, lockId: sha256(text),
-      holder, holderState: holder ? processState(holder) : 'UNREADABLE', pendingBreaks };
+      holder, holderState: holder ? recordedProcessState(holder) : 'UNREADABLE', pendingBreaks };
   }
 
   /**
@@ -333,7 +289,7 @@ export class DirectoryLock {
   async #acquire() {
     await this.#ensureDirectory();
     const token = randomUUID();
-    const record = JSON.stringify({ token, pid: process.pid, host: hostname(), lockedAt: new Date().toISOString() });
+    const record = writerRecord({ token, lockedAt: new Date().toISOString() });
     const temporary = this.#temporary(token);
     const deadline = Date.now() + this.timeoutMs;
     let delay = 2;
@@ -344,7 +300,7 @@ export class DirectoryLock {
         catch (error) { if (error.code !== 'EEXIST') throw error; }
         const holder = await this.#readHolder();
         if (holder === null) continue; // released between link() and read; retry now
-        if (!holder.unreadable && processState(holder) === 'DEAD' && await this.#breakStale(holder.token)) continue;
+        if (!holder.unreadable && recordedProcessState(holder) === 'DEAD' && await this.#breakStale(holder.token)) continue;
         if (Date.now() >= deadline) throw await this.#timeoutError();
         await sleep(delay);
         delay = Math.min(delay * 2, 50);
@@ -385,9 +341,19 @@ export class DirectoryLock {
     }
   }
 
-  async #release(token) {
-    // Only an owner removes its own lock; a live owner's lock is never broken.
-    if ((await this.#readHolder())?.token === token) await rm(this.lockFile, { force: true });
+  // Only an owner removes its own lock; a live owner's lock is never broken.
+  // Never throws: the operation has already committed (or failed) under the
+  // lock, and reporting a failed unlock instead would misstate that outcome. A
+  // lock that cannot be removed now (for example a scanner holding the file on
+  // Windows) is removed in the background while this process runs; meanwhile it
+  // blocks other callers as a live holder's lock does. Should this process exit
+  // first, its lock is stale and the next caller removes it.
+  async #release(token, attempt = 0) {
+    try {
+      if ((await this.#readHolder())?.token === token) await rm(this.lockFile, { force: true });
+    } catch {
+      retryLater(attempt, () => this.#release(token, attempt + 1));
+    }
   }
 
   // Runs while holding the lock, so a leftover temporary owned by this lock's
@@ -410,7 +376,7 @@ export class DirectoryLock {
         // Without a readable record, fall back to the PID in the name on this host.
         // If that guess is wrong, the live waiter's link() fails with ENOENT: an error, never a double grant.
         if (!waiter && waiterName[1]) waiter = { pid: Number(waiterName[1]), host: hostname() };
-        if (processState(waiter) === 'DEAD') await rm(file, { force: true });
+        if (recordedProcessState(waiter) === 'DEAD') await rm(file, { force: true });
       }
     } catch { /* Housekeeping never fails an otherwise valid operation. */ }
   }

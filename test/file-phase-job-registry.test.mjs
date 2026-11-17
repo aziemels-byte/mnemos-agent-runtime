@@ -8,22 +8,13 @@ import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { FilePhaseJobRegistry, GoalRecoveryCoordinator, FileCheckpointStore } from '../src/index.mjs';
 import { FileJobStore } from '../src/job-store.mjs';
-import { identityState, processIdentity } from '../src/directory-lock.mjs';
-import { deferred, temporaryDirectory, withTimeout, zombieProcess } from './helpers.mjs';
+import { identityState, processIdentity } from '../src/process-identity.mjs';
+import { deferred, temporaryDirectory, until, withTimeout, workerThread, zombieProcess } from './helpers.mjs';
 
 const recordText = (directory, jobId) =>
   readFile(path.join(directory, `${createHash('sha256').update(jobId).digest('hex')}.job.json`), 'utf8');
 const untilAborted = signal => new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
 
-async function until(predicate, label, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = await predicate();
-    if (value) return value;
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
-    await sleep(10);
-  }
-}
 
 test('a completed job survives a restart and its ID never runs again', async t => {
   const directory = await temporaryDirectory(t);
@@ -138,6 +129,7 @@ test('retry safety (effectAbsent) comes only from an explicit executor report', 
     completed_claim: async () => ({ status: 'COMPLETED', effectAbsent: true }),
     threw: async () => { throw new Error('sensitive diagnostic 9f3a'); },
     odd_status: async () => ({ status: 'CANCELLED' }), // cancelled without a request
+    unknown_report: async () => ({ status: 'UNKNOWN', effectAbsent: true }), // cannot tell; never effect-free
     hostile: async () => ({ get status() { throw new Error('hostile'); } })
   };
   const registry = new FilePhaseJobRegistry({ directory, execute: ({ jobId }) => reports[jobId]() });
@@ -153,6 +145,7 @@ test('retry safety (effectAbsent) comes only from an explicit executor report', 
     completed_claim: ['COMPLETED', false, null],
     threw: ['FAILED', false, 'EXECUTOR_THREW'],
     odd_status: ['FAILED', false, 'EXECUTOR_STATUS_UNEXPECTED'],
+    unknown_report: ['UNKNOWN', false, 'EXECUTOR_REPORTED_UNKNOWN'],
     hostile: ['FAILED', false, 'EXECUTOR_THREW']
   });
   assert.doesNotMatch(await recordText(directory, 'threw'), /sensitive|9f3a/);
@@ -962,4 +955,35 @@ test('a job killed mid-command leaves its process tree on record for a restart',
   assert.deepEqual(view.processes.map(entry => [entry.marker, entry.leader.pid]), [[seen.marker, seen.pid]],
     'what a restart needs to find the tree');
   await until(() => isGone(seen.pid), 'the supervisor to stop the orphaned tree');
+});
+
+// Threads of one process share its PID but not their lists of running executions (B13).
+
+test('a job running in another thread of this process is alive there, never reclassified or resumed', async t => {
+  const directory = await temporaryDirectory(t);
+  const worker = workerThread(t, `
+    const { FilePhaseJobRegistry } = await import(workerData.indexUrl);
+    // Reports from inside the executor: its dispatch is recorded by then, so the record stays as inspected.
+    const jobs = new FilePhaseJobRegistry({ directory: workerData.directory, execute: () => new Promise(resolve => {
+      parentPort.postMessage('running');
+      parentPort.once('message', () => resolve({ status: 'COMPLETED' }));
+    }) });
+    await jobs.start({ jobId: 'batch_import', objective: 'Import a batch', resumable: true });
+    parentPort.postMessage((await jobs.wait('batch_import')).status);`,
+  { directory, indexUrl: new URL('../src/index.mjs', import.meta.url).href });
+  assert.equal(await worker.next(), 'running');
+  const jobs = new FilePhaseJobRegistry({ directory, execute: async () => { throw new Error('must not run'); } });
+  const seen = await jobs.get('batch_import');
+  assert.deepEqual([seen.status, seen.ownerState], ['RUNNING', 'ALIVE']);
+  assert.deepEqual((await jobs.recover()).resumable, []);
+  await assert.rejects(jobs.resume({ jobId: 'batch_import', expectedSequence: seen.sequence, successorJobId: 'batch_import_2',
+    explicitAuthorization: true }), error => error.code === 'JOB_STOP_UNVERIFIED');
+  // An operator here may settle it only with the override, as for any live owner elsewhere.
+  await assert.rejects(jobs.reconcile({ jobId: 'batch_import', expectedSequence: seen.sequence, disposition: 'FAILED',
+    evidence: { authoritative: true, source: 'import-api:batch/9' }, explicitAuthorization: true }),
+  error => error.code === 'JOB_OWNER_UNVERIFIED' && error.ownerState === 'ALIVE');
+  const finished = worker.next();
+  worker.send('finish');
+  assert.equal(await finished, 'COMPLETED');
+  assert.equal((await jobs.get('batch_import')).status, 'COMPLETED');
 });

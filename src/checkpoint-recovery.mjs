@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
-import { open } from 'node:fs/promises';
 import path from 'node:path';
-import { DirectoryLock, replaceFile } from './directory-lock.mjs';
+import { DirectoryLock, readBoundedFile, replaceFile } from './directory-lock.mjs';
 import { VALID_JOB_ID, VALID_PHASE } from './phase-job-registry.mjs';
 
 const MAX_BYTES = 1024 * 1024;
@@ -38,10 +37,13 @@ export class FileCheckpointStore {
   /**
    * expectedRevision: undefined saves unconditionally; null requires that no
    * checkpoint exists; a revision requires the stored bytes to still match it.
-   * Resolves to { revision } of the written checkpoint.
+   * Resolves to { revision } of the written checkpoint; every failure, invalid
+   * arguments included, rejects. Saves are queued in call order.
    */
-  save(value, { expectedRevision } = {}) {
-    const text = JSON.stringify(value, null, 2) + '\n';
+  async save(value, { expectedRevision } = {}) {
+    const json = JSON.stringify(value, null, 2);
+    if (typeof json !== 'string') throw new TypeError('A checkpoint must be a JSON value');
+    const text = json + '\n';
     if (Buffer.byteLength(text) > MAX_BYTES) throw new RangeError('Checkpoint exceeds 1 MiB');
     if (expectedRevision !== undefined && expectedRevision !== null &&
       !(typeof expectedRevision === 'string' && REVISION.test(expectedRevision))) {
@@ -81,21 +83,9 @@ export class FileCheckpointStore {
   /** Operator override; see the README runbook. */
   forceUnlock(request) { return this.#lock.forceUnlock(request); }
 
-  async #readBytes() {
-    let file;
-    try {
-      file = await open(this.file, 'r');
-      const stat = await file.stat();
-      if (!stat.isFile() || stat.size > MAX_BYTES) throw new RangeError('Invalid checkpoint file');
-      const bytes = await file.readFile();
-      if (bytes.length > MAX_BYTES) throw new RangeError('Checkpoint exceeds 1 MiB');
-      return bytes;
-    } catch (error) {
-      if (error.code === 'ENOENT') return null;
-      throw error;
-    } finally {
-      await file?.close();
-    }
+  #readBytes() {
+    return readBoundedFile(this.file, MAX_BYTES,
+      reason => new RangeError(reason === 'TOO_LARGE' ? 'Checkpoint exceeds 1 MiB' : 'Invalid checkpoint file'));
   }
 }
 

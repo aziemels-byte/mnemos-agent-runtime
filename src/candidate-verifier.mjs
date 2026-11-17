@@ -69,7 +69,9 @@ export function createCandidateVerifier({ runRegression } = {}) {
       passed,
       reason: passed ? 'regression_passed' : 'regression_failed',
       changedFiles,
-      exitCode: result?.exitCode ?? null
+      exitCode: result?.exitCode ?? null,
+      // The runner's evidence (TestEvidence.regressionRunner), for QualityGate.review().
+      ...(typeof result?.evidenceId === 'string' ? { evidenceId: result.evidenceId, subject: result.subject ?? null } : {})
     };
   };
 }

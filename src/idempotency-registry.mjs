@@ -1,18 +1,35 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { open, readdir } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
-import { DirectoryLock, processState, replaceFile } from './directory-lock.mjs';
+import { DirectoryLock, readBoundedFile, replaceFile, retryLater } from './directory-lock.mjs';
+import { executionOwner, isExecutionLive, markExecutionEnded, markExecutionLive, ownerState } from './process-identity.mjs';
 
 const copy = value => structuredClone(value);
 function requiredString(value, label) {
   if (typeof value !== 'string' || !value.trim()) throw new TypeError(label + ' must be a non-empty string');
   return value.trim();
 }
-function requestFingerprint(request) {
-  // Treat the request as immutable. JSON key order is significant by design.
-  return createHash('sha256').update(JSON.stringify(request ?? {})).digest('hex');
+const sha256 = text => createHash('sha256').update(text).digest('hex');
+// JSON.stringify with the keys of every object sorted: requests that differ only
+// in key order are the same request. Accepts what JSON.stringify accepts.
+const sortedKeys = (key, value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+  ? Object.fromEntries(Object.keys(value).sort().map(name => [name, value[name]])) : value;
+
+/**
+ * A request's fingerprint (key order does not matter), and the fingerprint
+ * earlier versions stored (key order mattered). Treat the request as immutable.
+ */
+function requestIdentity(request) {
+  const value = request ?? {};
+  return { fingerprint: sha256(JSON.stringify(value, sortedKeys)), legacy: sha256(JSON.stringify(value)) };
 }
+
+// Whether a record was made for this request. A record of an earlier version
+// stores the legacy fingerprint: both are serializations of the same request, so
+// either one matching proves it is the same request.
+const sameRequest = (record, identity) => record.fingerprint === identity.fingerprint || record.fingerprint === identity.legacy;
+
 function metadataError(error, status, key, retryAllowed = false) {
   const reported = error instanceof Error ? error : new Error(String(error));
   reported.idempotency = { status, key, retryAllowed, reconciliationRequired: status === 'IDEMPOTENCY_UNKNOWN' };
@@ -22,9 +39,9 @@ function metadataError(error, status, key, retryAllowed = false) {
 // Decision rules shared by the in-memory and the file-backed registry.
 
 /** Response for an existing record, or null when the effect may run (again). */
-function existingOutcome(previous, fingerprint, retryFailed, key) {
+function existingOutcome(previous, identity, retryFailed, key) {
   if (!previous) return null;
-  if (previous.fingerprint !== fingerprint) return { status: 'IDEMPOTENCY_CONFLICT', key, executed: false };
+  if (!sameRequest(previous, identity)) return { status: 'IDEMPOTENCY_CONFLICT', key, executed: false };
   if (previous.state === 'COMPLETED') return { status: 'IDEMPOTENT_REPLAY', key, executed: false, result: copy(previous.result) };
   if (previous.state === 'UNKNOWN' || previous.state === 'STARTED') {
     return { status: 'IDEMPOTENCY_UNKNOWN', key, executed: false, reconciliationRequired: true };
@@ -33,6 +50,16 @@ function existingOutcome(previous, fingerprint, retryFailed, key) {
     return { status: 'IDEMPOTENCY_FAILED', key, executed: false, retryAllowed: previous.effectAbsent === true };
   }
   return null;
+}
+
+/**
+ * Whether a failure certainly had no effect. failureProvesNoEffect is true, or
+ * a function of the error that returns true only for such a failure; anything
+ * else, including a function that throws, means the effect may have happened.
+ */
+function provesNoEffect(failureProvesNoEffect, error) {
+  if (typeof failureProvesNoEffect !== 'function') return failureProvesNoEffect === true;
+  try { return failureProvesNoEffect(error) === true; } catch { return false; }
 }
 
 function failureRecord(started, noEffect, now) {
@@ -47,7 +74,7 @@ function unknownRecord(record, reason, now) {
 /** Response when reconciliation cannot proceed, or null when it may. */
 function reconciliationRefusal(record, request, evidence, key) {
   if (!record) return { status: 'IDEMPOTENCY_NOT_FOUND', key, reconciled: false };
-  if (record.fingerprint !== requestFingerprint(request)) return { status: 'IDEMPOTENCY_CONFLICT', key, reconciled: false };
+  if (!sameRequest(record, requestIdentity(request))) return { status: 'IDEMPOTENCY_CONFLICT', key, reconciled: false };
   if (!['UNKNOWN', 'STARTED'].includes(record.state)) return { status: 'IDEMPOTENCY_RECONCILIATION_NOT_REQUIRED', key, reconciled: false };
   if (evidence?.authoritative !== true) return { status: 'IDEMPOTENCY_EVIDENCE_REQUIRED', key, reconciled: false };
   return null;
@@ -124,14 +151,15 @@ export class IdempotencyRegistry {
     if (this.restoring) throw new Error('Restoration is in progress');
     if (this.reconciling.has(key)) throw new Error('Reconciliation is running for this key');
     if (typeof operation !== 'function') throw new TypeError('operation must be a function');
-    const fingerprint = requestFingerprint(request);
+    const identity = requestIdentity(request);
+    const { fingerprint } = identity;
     const active = this.inflight.get(key);
     if (active) {
       if (active.fingerprint !== fingerprint) return { status: 'IDEMPOTENCY_CONFLICT', key, executed: false };
       return active.promise; // one effect, multiple waiters
     }
     const previous = this.records.get(key);
-    const outcome = existingOutcome(previous, fingerprint, retryFailed, key);
+    const outcome = existingOutcome(previous, identity, retryFailed, key);
     if (outcome) return outcome;
     const started = { key, fingerprint, state: 'STARTED', startedAt: this.clock().toISOString(),
       attempt: (previous?.attempt ?? 0) + 1 };
@@ -147,10 +175,17 @@ export class IdempotencyRegistry {
     let result;
     try { result = await operation(); }
     catch (error) {
-      const noEffect = failureProvesNoEffect === true;
+      const noEffect = provesNoEffect(failureProvesNoEffect, error);
       const failed = failureRecord(started, noEffect, this.clock().toISOString());
       this.records.set(started.key, failed); // never retry silently on a failed journal write
-      await this.persist(noEffect ? 'idempotency.failed' : 'idempotency.unknown', failed);
+      try {
+        await this.persist(noEffect ? 'idempotency.failed' : 'idempotency.unknown', failed);
+      } catch {
+        // The journal still says STARTED, which restore() turns into UNKNOWN: say so
+        // here too, with the operation's own error rather than the journal's.
+        this.records.set(started.key, unknownRecord(started, 'FAILURE_PERSISTENCE_FAILED', this.clock().toISOString()));
+        throw metadataError(error, 'IDEMPOTENCY_UNKNOWN', started.key);
+      }
       throw metadataError(error, noEffect ? 'IDEMPOTENCY_FAILED' : 'IDEMPOTENCY_UNKNOWN', started.key, noEffect);
     }
     const completed = { ...started, state: 'COMPLETED', completedAt: this.clock().toISOString(),
@@ -199,20 +234,11 @@ const MAX_RECORD_BYTES = 1024 * 1024;
 const STATES = new Set(['STARTED', 'COMPLETED', 'FAILED', 'UNKNOWN']);
 const RECORD_FILE = /^[0-9a-f]{64}\.record\.json$/;
 const RECORD_TEMPORARY = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\.record\.tmp$/;
-// Executions running in this process. A STARTED record owned by this PID whose
-// execution is not listed here was left by an earlier process that reused the PID,
-// or by a finalization that failed; either way it is not running.
-const liveExecutions = new Set();
+// Writes over this execution's own record that will not succeed by trying again.
+const FINAL_WRITE_ERRORS = new Set(['IDEMPOTENCY_RECORD_CHANGED', 'IDEMPOTENCY_STATE_INVALID']);
 
 function stateError(message, details = {}) {
   return Object.assign(new Error(message), { code: 'IDEMPOTENCY_STATE_INVALID', ...details });
-}
-
-function ownerState(owner) {
-  if (owner?.pid === process.pid && owner.host === hostname()) {
-    return liveExecutions.has(owner.executionId) ? 'ALIVE' : 'DEAD';
-  }
-  return processState(owner);
 }
 
 /**
@@ -239,35 +265,35 @@ export class FileIdempotencyRegistry {
   async execute({ key, request = {}, operation, retryFailed = false, failureProvesNoEffect = false } = {}) {
     key = requiredString(key, 'key');
     if (typeof operation !== 'function') throw new TypeError('operation must be a function');
-    const fingerprint = requestFingerprint(request);
+    const identity = requestIdentity(request);
     const active = this.#inflight.get(key);
     if (active) {
-      if (active.fingerprint !== fingerprint) return { status: 'IDEMPOTENCY_CONFLICT', key, executed: false };
+      if (active.fingerprint !== identity.fingerprint) return { status: 'IDEMPOTENCY_CONFLICT', key, executed: false };
       return active.promise; // one effect, multiple waiters in this instance
     }
-    const promise = Promise.resolve().then(() => this.#run(key, fingerprint, operation, retryFailed, failureProvesNoEffect));
-    this.#inflight.set(key, { fingerprint, promise });
+    const promise = Promise.resolve().then(() => this.#run(key, identity, operation, retryFailed, failureProvesNoEffect));
+    this.#inflight.set(key, { fingerprint: identity.fingerprint, promise });
     try { return await promise; }
     finally { if (this.#inflight.get(key)?.promise === promise) this.#inflight.delete(key); }
   }
 
-  async #run(key, fingerprint, operation, retryFailed, failureProvesNoEffect) {
+  async #run(key, identity, operation, retryFailed, failureProvesNoEffect) {
     const executionId = randomUUID();
     const reservation = await this.#lock.run(async () => {
       let previous = await this.#read(key);
-      if (previous?.state === 'STARTED' && previous.fingerprint === fingerprint) {
+      if (previous?.state === 'STARTED' && sameRequest(previous, identity)) {
         if (ownerState(previous.owner) !== 'DEAD') return { response: { status: 'IDEMPOTENCY_IN_PROGRESS', key, executed: false } };
         previous = unknownRecord(previous, 'INTERRUPTED_AFTER_EFFECT_START', this.clock().toISOString());
         await this.#write(previous);
       }
-      const outcome = existingOutcome(previous, fingerprint, retryFailed, key);
+      const outcome = existingOutcome(previous, identity, retryFailed, key);
       if (outcome) return { response: outcome };
-      const started = { key, fingerprint, state: 'STARTED', startedAt: this.clock().toISOString(),
-        attempt: (previous?.attempt ?? 0) + 1, owner: { pid: process.pid, host: hostname(), executionId } };
+      const started = { key, fingerprint: identity.fingerprint, state: 'STARTED', startedAt: this.clock().toISOString(),
+        attempt: (previous?.attempt ?? 0) + 1, owner: executionOwner(executionId) };
       // Listed before the record becomes visible, so this process never sees it as dead.
-      liveExecutions.add(executionId);
+      markExecutionLive(executionId);
       try { await this.#write(started); }
-      catch (error) { liveExecutions.delete(executionId); throw error; }
+      catch (error) { markExecutionEnded(executionId); throw error; }
       return { started };
     });
     if (reservation.response) return reservation.response;
@@ -277,30 +303,48 @@ export class FileIdempotencyRegistry {
       let outcome;
       try { outcome = { succeeded: true, result: await operation() }; }
       catch (error) { outcome = { succeeded: false, error }; }
-      return await this.#finish(started, outcome, failureProvesNoEffect === true);
+      return await this.#finish(started, outcome, !outcome.succeeded && provesNoEffect(failureProvesNoEffect, outcome.error));
     } finally {
-      liveExecutions.delete(executionId);
+      markExecutionEnded(executionId);
     }
   }
 
   async #finish(started, { succeeded, result, error }, noEffect) {
     const key = started.key;
+    const now = this.clock().toISOString();
+    let outcome;
     try {
-      await this.#replaceOwn(started, succeeded
-        ? { ...started, state: 'COMPLETED', completedAt: this.clock().toISOString(), result: copy(result), reconciliationRequired: false }
-        : failureRecord(started, noEffect, this.clock().toISOString()));
-    } catch (persistError) {
-      // The effect may have happened but its outcome is not recorded: fail closed.
-      if (persistError.code !== 'IDEMPOTENCY_RECORD_CHANGED') {
-        const unknown = unknownRecord(started, succeeded ? 'COMPLETION_PERSISTENCE_FAILED' : 'FAILURE_PERSISTENCE_FAILED',
-          this.clock().toISOString());
-        try { await this.#replaceOwn(started, unknown); }
-        catch (error) { if (error.code !== 'IDEMPOTENCY_RECORD_CHANGED') this.#retryUnknown(started, unknown); }
-      }
-      throw metadataError(succeeded ? persistError : error, 'IDEMPOTENCY_UNKNOWN', key);
+      outcome = succeeded
+        ? { ...started, state: 'COMPLETED', completedAt: now, result: copy(result), reconciliationRequired: false }
+        : failureRecord(started, noEffect, now);
+      this.#encode(outcome);
+    } catch (unrecordable) {
+      // A result that is not JSON, or too large, can never be recorded. The
+      // effect happened (or may have): record UNKNOWN instead.
+      await this.#recordOwn(started, unknownRecord(started, succeeded ? 'COMPLETION_PERSISTENCE_FAILED' : 'FAILURE_PERSISTENCE_FAILED', now));
+      throw metadataError(succeeded ? unrecordable : error, 'IDEMPOTENCY_UNKNOWN', key);
     }
+    const persistError = await this.#recordOwn(started, outcome);
+    // Not recorded (yet): it is retried in the background, or someone else decided. Uncertain here.
+    if (persistError) throw metadataError(succeeded ? persistError : error, 'IDEMPOTENCY_UNKNOWN', key);
     if (!succeeded) throw metadataError(error, noEffect ? 'IDEMPOTENCY_FAILED' : 'IDEMPOTENCY_UNKNOWN', key, noEffect);
     return { status: 'IDEMPOTENCY_EXECUTED', key, executed: true, result: copy(result) };
+  }
+
+  /**
+   * Record what this execution knows over its own STARTED record. Resolves to
+   * null once written, or to the error. A write that may succeed later is
+   * retried in the background; one refused because the record is no longer
+   * ours (IDEMPOTENCY_RECORD_CHANGED) or is unreadable is not.
+   */
+  async #recordOwn(started, record) {
+    try {
+      await this.#replaceOwn(started, record);
+      return null;
+    } catch (error) {
+      if (!FINAL_WRITE_ERRORS.has(error.code)) this.#retryOwn(started, record);
+      return error;
+    }
   }
 
   // Replace the record only while it is still this execution's STARTED record.
@@ -315,20 +359,17 @@ export class FileIdempotencyRegistry {
   }
 
   // Other processes judge a STARTED record by its owner's PID, which stays alive
-  // after this execution ends. Until UNKNOWN is written they would report the key
-  // IN_PROGRESS for this process's lifetime, so keep trying in the background.
-  // Stops once written, once the record is no longer ours, if the record is
-  // unreadable (an operator must act), or when the process exits (timers are
-  // unref'd; a dead owner is then detected by other processes).
-  #retryUnknown(started, unknown, attempt = 0) {
-    const timer = setTimeout(() => {
-      this.#replaceOwn(started, unknown).catch(error => {
-        if (!['IDEMPOTENCY_RECORD_CHANGED', 'IDEMPOTENCY_STATE_INVALID'].includes(error.code)) {
-          this.#retryUnknown(started, unknown, attempt + 1);
-        }
-      });
-    }, Math.min(25 * 2 ** attempt, 2_000));
-    timer.unref?.();
+  // after this execution ends. Until the outcome this execution knows is written
+  // they would report the key IN_PROGRESS for this process's lifetime, so keep
+  // trying in the background. Each attempt writes only over this execution's own
+  // STARTED record: it stops once written, once the record is no longer ours (in
+  // this thread a later call already turned it UNKNOWN, which then stands), if
+  // the record is unreadable (an operator must act), or when the process exits
+  // (timers are unref'd; a dead owner is then detected by other processes).
+  #retryOwn(started, record, attempt = 0) {
+    retryLater(attempt, () => this.#replaceOwn(started, record).catch(error => {
+      if (!FINAL_WRITE_ERRORS.has(error.code)) this.#retryOwn(started, record, attempt + 1);
+    }));
   }
 
   /**
@@ -351,7 +392,7 @@ export class FileIdempotencyRegistry {
     if (this.#inflight.has(key)) throw new Error('Cannot reconcile while the operation is running');
     return this.#lock.run(async () => {
       const record = await this.#read(key);
-      const observedOwnerState = record?.state === 'STARTED' && record.fingerprint === requestFingerprint(request)
+      const observedOwnerState = record?.state === 'STARTED' && sameRequest(record, requestIdentity(request))
         ? ownerState(record.owner) : null;
       const ownerNotProvablyDead = observedOwnerState !== null && observedOwnerState !== 'DEAD';
       if (override && record) {
@@ -359,7 +400,8 @@ export class FileIdempotencyRegistry {
           throw Object.assign(new Error('The record changed since it was inspected; inspect it again'),
             { code: 'IDEMPOTENCY_RECORD_CHANGED', key });
         }
-        if (observedOwnerState === 'ALIVE' && record.owner.pid === process.pid && record.owner.host === hostname()) {
+        if (observedOwnerState === 'ALIVE' && record.owner.pid === process.pid && record.owner.host === hostname() &&
+          isExecutionLive(record.owner.executionId)) {
           throw new Error('Cannot reconcile while the operation is running'); // certain: it runs in this process
         }
       } else if (ownerNotProvablyDead) {
@@ -419,17 +461,10 @@ export class FileIdempotencyRegistry {
 
   // Never treats an unreadable record as absent: that would run the effect again.
   async #readFile(file) {
-    let text;
-    try {
-      const handle = await open(file, 'r');
-      try {
-        if ((await handle.stat()).size > MAX_RECORD_BYTES) throw stateError('Idempotency record exceeds 1 MiB', { file });
-        text = await handle.readFile('utf8');
-      } finally { await handle.close(); }
-    } catch (error) {
-      if (error.code === 'ENOENT') return null;
-      throw error;
-    }
+    const bytes = await readBoundedFile(file, MAX_RECORD_BYTES, reason =>
+      stateError(reason === 'TOO_LARGE' ? 'Idempotency record exceeds 1 MiB' : 'Idempotency record is not a file', { file }));
+    if (bytes === null) return null;
+    const text = bytes.toString('utf8');
     let stored;
     try { stored = JSON.parse(text); }
     catch { throw stateError('Idempotency record is not valid JSON; reconciliation required', { file }); }
@@ -442,9 +477,14 @@ export class FileIdempotencyRegistry {
     return record;
   }
 
-  async #write(record) {
+  // The stored text of a record; throws for a result that is not JSON or too large.
+  #encode(record) {
     const text = JSON.stringify({ schema: RECORD_SCHEMA, record }, null, 2) + '\n';
     if (Buffer.byteLength(text) > MAX_RECORD_BYTES) throw new RangeError('Idempotency record exceeds 1 MiB');
-    await replaceFile(this.#file(record.key), text, '.record.tmp', { syncDirectory: true });
+    return text;
+  }
+
+  async #write(record) {
+    await replaceFile(this.#file(record.key), this.#encode(record), '.record.tmp', { syncDirectory: true });
   }
 }

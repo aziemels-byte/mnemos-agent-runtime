@@ -236,7 +236,9 @@ test('inputs and options are validated', async t => {
   await store.create(newJob('job_1'));
   await assert.rejects(store.update('job_1', { expectedSequence: 1, changes: null }), /changes/);
   await assert.rejects(store.update('job_1', { expectedSequence: 1, changes: { owner: owner() } }), { code: 'JOB_RECORD_INVALID' });
-  assert.deepEqual((await readdir(directory)).sort(), [`${fingerprint('identified')}.job.json`, `${fingerprint('job_1')}.job.json`].sort());
+  // Only the two jobs created have a record and a history; rejected ones wrote nothing.
+  assert.deepEqual((await readdir(directory)).sort(), ['identified', 'job_1']
+    .flatMap(jobId => [`${fingerprint(jobId)}.job.json`, `${fingerprint(jobId)}.history.jsonl`]).sort());
 });
 
 // Records renames and flushes (with the flushed path) until the test ends.

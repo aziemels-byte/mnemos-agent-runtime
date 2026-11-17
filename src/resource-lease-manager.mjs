@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { open } from 'node:fs/promises';
 import path from 'node:path';
-import { DirectoryLock, replaceFile } from './directory-lock.mjs';
+import { DirectoryLock, readBoundedFile, replaceFile } from './directory-lock.mjs';
 
 const copy = value => structuredClone(value);
 const resourceId = value => /^(gpu:\d+|cpu:[a-z0-9._-]+|workspace:[a-z0-9._-]+|capability:[a-z0-9._-]+)$/i.test(value);
@@ -336,17 +335,10 @@ export class FileResourceLeaseManager {
   }
 
   async #load() {
-    let text;
-    try {
-      const file = await open(this.stateFile, 'r');
-      try {
-        if ((await file.stat()).size > MAX_STATE_BYTES) throw stateError('Lease state exceeds 1 MiB');
-        text = await file.readFile('utf8');
-      } finally { await file.close(); }
-    } catch (error) {
-      if (error.code === 'ENOENT') return { lastFencingToken: 0, leases: [] };
-      throw error;
-    }
+    const bytes = await readBoundedFile(this.stateFile, MAX_STATE_BYTES,
+      reason => stateError(reason === 'TOO_LARGE' ? 'Lease state exceeds 1 MiB' : 'Lease state is not a file'));
+    if (bytes === null) return { lastFencingToken: 0, leases: [] };
+    const text = bytes.toString('utf8');
     // Never treat unreadable state as empty: that would re-grant held resources.
     let value;
     try { value = JSON.parse(text); }

@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { identityState, processIdentity, processState } from './directory-lock.mjs';
+import {
+  executionOwner, identityState, isExecutionLive, markExecutionEnded, markExecutionLive, ownerState
+} from './process-identity.mjs';
+import { retryLater } from './directory-lock.mjs';
 import { FileJobStore, boundResult } from './job-store.mjs';
 import { groupCarriesMarker, runSupervised, scanTree, stopTree } from './process-tree.mjs';
 import {
-  CANCELLED_BEFORE_DISPATCH, VALID_JOB_ID, VALID_PHASE, boundedSettlement, jsonInput, reconciledState,
-  reconciliationRequest, settlementOutcome, thrownOutcome
+  CANCELLED_BEFORE_DISPATCH, VALID_PHASE, boundedSettlement, jobError, jsonInput, reconciledState,
+  reconciliationRequest, requireJobId, settlementOutcome, thrownOutcome
 } from './phase-job-registry.mjs';
 
 const MAX_INPUT_BYTES = 65536;
@@ -24,36 +27,10 @@ const OWNER_DIED_BEFORE_DISPATCH = Object.freeze({ status: 'CANCELLED', reason: 
 const OWNER_DIED_AFTER_DISPATCH = Object.freeze({ status: 'UNKNOWN', reason: 'OWNER_DIED_AFTER_DISPATCH',
   cancellationConfirmed: false, effectAbsent: false, reconciliationRequired: true });
 
-// Executions owned by registries in this process, listed before their record
-// becomes visible and removed once their outcome is recorded (or can no longer
-// be). A RUNNING record with this process's PID whose execution is not listed
-// was left by an earlier process that had the same PID: it is not running.
-const liveExecutions = new Set();
-
-// This process's identity, recorded as the owner of the jobs it starts. On
-// Linux it includes the boot ID and start time; elsewhere only { pid, host }.
-let ownIdentity;
-function ownerIdentity() {
-  ownIdentity ??= processIdentity(process.pid);
-  const { bootId, startTicks } = ownIdentity;
-  return bootId === undefined ? {} : { bootId, startTicks };
-}
-
-/**
- * ALIVE, DEAD (provably gone), OTHER_HOST or UNREADABLE (cannot be verified).
- * Only DEAD permits reclassifying the owner's job. An owner recorded with its
- * process identity is DEAD once the host rebooted or its PID belongs to a
- * process that started at another time; one recorded without it (another
- * platform, an earlier version) is judged by its PID alone.
- */
-function ownerState(owner) {
-  if (owner?.pid === process.pid && owner.host === hostname()) {
-    return liveExecutions.has(owner.executionId) ? 'ALIVE' : 'DEAD';
-  }
-  if (owner?.startTicks === undefined) return processState(owner);
-  const state = identityState(owner);
-  return state === 'UNVERIFIED' ? 'ALIVE' : state; // cannot compare: possibly alive
-}
+// A job's owner is judged by ownerState() (process-identity.mjs): only DEAD, a
+// provably gone owner, permits reclassifying its job. Owners are recorded with
+// this process's identity (on Linux its boot ID and start time), so that a later
+// reuse of the PID cannot make a dead owner look alive.
 
 const OWNER_DIED_REASONS = new Set(['OWNER_DIED_BEFORE_DISPATCH', 'OWNER_DIED_AFTER_DISPATCH']);
 const MAX_TERMINATION_WAIT_MS = 60_000;
@@ -78,13 +55,25 @@ function processesState(record) {
   }
   return unverified ? 'UNVERIFIED' : 'NONE';
 }
-const sha256 = text => createHash('sha256').update(text).digest('hex');
-const jobError = (code, message, details = {}) => Object.assign(new Error(message), { code, ...details });
 
-function requireJobId(jobId) {
-  if (typeof jobId !== 'string' || !VALID_JOB_ID.test(jobId)) throw new TypeError('Invalid job ID');
-  return jobId;
+/**
+ * Why a stopped job's stop is not verified, or null when it is: a process it
+ * recorded may still run, or it was settled by an operator override while its
+ * owner may still run it. The one rule behind resume() and recover().resumable.
+ * Accepts a stored record or its snapshot.
+ */
+function unverifiedStop(job) {
+  const processes = processesState(job);
+  if (processes !== 'NONE') return { message: 'Processes recorded by the job may still run', details: { processesState: processes } };
+  if (job.reconciliation?.override) {
+    const state = ownerState(job.owner);
+    if (state !== 'DEAD') {
+      return { message: 'The job was reconciled over a running or unverified owner, which may still run it', details: { ownerState: state } };
+    }
+  }
+  return null;
 }
+const sha256 = text => createHash('sha256').update(text).digest('hex');
 
 /** The public view of a stored record. */
 function snapshotOf(record) {
@@ -175,19 +164,19 @@ export class FilePhaseJobRegistry {
     this.#reserved++;
     const executionId = randomUUID();
     // Listed before the record becomes visible, so this process never sees it as dead.
-    liveExecutions.add(executionId);
+    markExecutionLive(executionId);
     let created;
     try {
       created = await this.#store.create({ jobId, objective, fingerprint, resumable,
-        owner: { pid: process.pid, host: hostname(), executionId, ...ownerIdentity() } });
+        owner: executionOwner(executionId) });
     } catch (error) {
-      liveExecutions.delete(executionId);
+      markExecutionEnded(executionId);
       throw error;
     } finally {
       this.#reserved--;
     }
     if (!created.created) {
-      liveExecutions.delete(executionId);
+      markExecutionEnded(executionId);
       return this.#sameIdentity(this.#live.get(jobId) ?? created.record, objective, fingerprint, resumable);
     }
     return this.#launch(created.record, copy, null);
@@ -241,15 +230,8 @@ export class FilePhaseJobRegistry {
       throw jobError('JOB_STOP_UNVERIFIED', 'The job may still run: let it settle, resolve it (get) or stop it first',
         { jobId, ownerState: ownerState(record.owner) });
     }
-    const processes = processesState(record);
-    if (processes !== 'NONE') {
-      throw jobError('JOB_STOP_UNVERIFIED', 'Processes recorded by the job may still run', { jobId, processesState: processes });
-    }
-    // A job settled by an operator override: its owner may still be running it.
-    if (record.reconciliation?.override && ownerState(record.owner) !== 'DEAD') {
-      throw jobError('JOB_STOP_UNVERIFIED', 'The job was reconciled over a running or unverified owner, which may still run it',
-        { jobId, ownerState: ownerState(record.owner) });
-    }
+    const unverified = unverifiedStop(record);
+    if (unverified) throw jobError('JOB_STOP_UNVERIFIED', unverified.message, { jobId, ...unverified.details });
     if (record.resumedBy !== undefined && record.resumedBy !== successorJobId) {
       throw jobError('JOB_ALREADY_RESUMED', 'The job was already resumed by another attempt', { jobId, resumedBy: record.resumedBy });
     }
@@ -259,22 +241,22 @@ export class FilePhaseJobRegistry {
     }
     this.#reserved++;
     const executionId = randomUUID();
-    liveExecutions.add(executionId);
+    markExecutionLive(executionId);
     let resumed;
     try {
       const changes = record.status === 'UNKNOWN'
         ? { status: 'CANCELLED', reason: 'RESUMED', reconciliationRequired: false, cancellationConfirmed: true, effectAbsent: false }
         : {};
       resumed = await this.#store.resume({ jobId, expectedSequence, changes,
-        successor: { jobId: successorJobId, owner: { pid: process.pid, host: hostname(), executionId, ...ownerIdentity() } } });
+        successor: { jobId: successorJobId, owner: executionOwner(executionId) } });
     } catch (error) {
-      liveExecutions.delete(executionId);
+      markExecutionEnded(executionId);
       throw error;
     } finally {
       this.#reserved--;
     }
     if (!resumed.created) { // resumed before: report that attempt, never run it twice
-      liveExecutions.delete(executionId);
+      markExecutionEnded(executionId);
       return this.#resolve(resumed.successor);
     }
     const { successor } = resumed;
@@ -408,7 +390,7 @@ export class FilePhaseJobRegistry {
       orphaned: jobs.filter(job => job.orphaned === true).map(job => job.jobId),
       // Candidates for resume(): stopped, with their stop verified, and not resumed yet.
       resumable: jobs.filter(job => job.resumable && ['UNKNOWN', 'CANCELLED', 'FAILED'].includes(job.status) &&
-        job.resumedBy === null && processesState(job) === 'NONE').map(job => job.jobId),
+        job.resumedBy === null && unverifiedStop(job) === null).map(job => job.jobId),
       // Linked to a successor that was never recorded (a crash between the two writes of resume()).
       // (A successor whose record is unreadable is listed in `invalid`, not here.)
       resumeIncomplete: jobs.filter(job => job.resumedBy !== null && !jobs.some(other => other.jobId === job.resumedBy) &&
@@ -457,7 +439,8 @@ export class FilePhaseJobRegistry {
     let state;
     if (record.status === 'RUNNING') {
       state = ownerState(record.owner);
-      if (state === 'ALIVE' && record.owner.pid === process.pid && record.owner.host === hostname()) {
+      if (state === 'ALIVE' && record.owner.pid === process.pid && record.owner.host === hostname() &&
+        isExecutionLive(record.owner.executionId)) {
         throw jobError('JOB_RUNNING_HERE', 'The job is executing in this process; it cannot be reconciled', { jobId });
       }
       if (state !== 'DEAD') {
@@ -572,6 +555,27 @@ export class FilePhaseJobRegistry {
     return { confirmed, receipts, job: snapshotOf(updated) };
   }
 
+  /**
+   * The recorded history of one job: { jobId, events, complete, missing,
+   * unreadableLines }, or null when it was never recorded. One event per write
+   * of its record, oldest first: { jobId, rootJobId, sequence, at, type, changed,
+   * status, phase, reason, ... }. Types: CREATED, DISPATCHED, PHASE_CHANGED,
+   * PROGRESS_SAVED, PROCESS_RECORDED, CANCELLATION_REQUESTED, STATUS_CHANGED,
+   * RECONCILED, ORPHANS_TERMINATED, RESUMED, UPDATED. `complete` is false when an
+   * event is missing (listed in `missing`) or unreadable; the record stays the
+   * source of truth. State held only in this process (a running job's latest
+   * phase) appears once it is recorded.
+   */
+  history(jobId) { return this.#store.history(requireJobId(jobId)); }
+
+  /**
+   * Events of all recorded jobs, oldest first, matching every given filter:
+   * { jobId, rootJobId (all attempts of a resumed job), type, status, reason,
+   * since, until (timestamps), limit (default 1000; the most recent are kept) }.
+   * Resolves to { events, truncated, invalid, unreadableLines }.
+   */
+  searchHistory(filters) { return this.#store.searchHistory(filters); }
+
   inspectLock() { return this.#store.inspectLock(); }
   forceUnlock(request) { return this.#store.forceUnlock(request); }
 
@@ -658,9 +662,9 @@ export class FilePhaseJobRegistry {
    * so that a restart can find it. If the record cannot be written first, the
    * command never starts and the result says so (effectAbsent: true).
    */
-  #runProcess(entry, { command, args, cwd, env, stdio, graceMs, killWaitMs, trackIntervalMs } = {}) {
+  #runProcess(entry, { command, args, cwd, env, stdio, onOutput, graceMs, killWaitMs, trackIntervalMs } = {}) {
     const identityOf = ({ pid, host, bootId, startTicks }) => (bootId === undefined ? { pid, host } : { pid, host, bootId, startTicks });
-    return runSupervised({ command, args, cwd, env, stdio, graceMs, killWaitMs, trackIntervalMs, signal: entry.controller.signal,
+    return runSupervised({ command, args, cwd, env, stdio, onOutput, graceMs, killWaitMs, trackIntervalMs, signal: entry.controller.signal,
       beforeStart: async ({ supervisor, marker }) => {
         if (entry.state !== 'running') throw new Error('The job is no longer running');
         if (!supervisor) throw new Error('The process supervisor is not running');
@@ -731,7 +735,7 @@ export class FilePhaseJobRegistry {
       await this.#write(entry, () => this.#outcomeChanges(entry));
       entry.state = 'recorded';
       this.#live.delete(entry.jobId);
-      liveExecutions.delete(entry.record.owner.executionId);
+      markExecutionEnded(entry.record.owner.executionId);
     } catch (error) {
       // Until the outcome is recorded this process reports UNKNOWN. Transient
       // failures are retried in the background; after a restart, the stored
@@ -740,7 +744,7 @@ export class FilePhaseJobRegistry {
       if (PERMANENT.has(error.code)) {
         // This execution will not write again: let other instances judge the
         // record as they would after this process exits.
-        liveExecutions.delete(entry.record.owner.executionId);
+        markExecutionEnded(entry.record.owner.executionId);
         if (error.code === 'JOB_RECORD_CHANGED') {
           // Someone else decided the outcome (an operator reconciliation): their
           // record stands and this execution's late outcome is not recorded.
@@ -748,8 +752,7 @@ export class FilePhaseJobRegistry {
           this.#live.delete(entry.jobId);
         }
       } else {
-        const timer = setTimeout(() => this.#recordOutcome(entry, attempt + 1), Math.min(25 * 2 ** attempt, 2_000));
-        timer.unref?.();
+        retryLater(attempt, () => this.#recordOutcome(entry, attempt + 1));
       }
     }
   }
